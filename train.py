@@ -39,12 +39,12 @@ class SimpleTrainer2d:
         self.H, self.W = self.gt_image.shape[2], self.gt_image.shape[3]
         self.iterations = iterations
         self.save_imgs = args.save_imgs
-        self.log_dir = Path(f"./checkpoints/iter{args.iterations}_pts{num_points}/{self.image_name}")
+        self.log_dir = Path(f"./checkpoints/{args.data_name}/iter{args.iterations}_pts{num_points}/{self.image_name}")
 
 
         from gaussianimage_cholesky import GaussianImage_Cholesky
         self.gaussian_model = GaussianImage_Cholesky(loss_type="L2", opt_type="adan", num_points=self.num_points, H=self.H, W=self.W, BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W,
-            device=self.device, lr=args.lr, quantize=False).to(self.device)
+            device=self.device, lr=args.lr).to(self.device)
 
         self.logwriter = LogWriter(self.log_dir)
 
@@ -103,8 +103,20 @@ class SimpleTrainer2d:
 
 def image_path_to_tensor(image_path: Path):
     img = Image.open(image_path)
+    print(f"image mode {img.mode}")
+    print(f"Original Image size: {img.size}, mode: {img.mode}")
+
+    # Ensure the image is in RGB mode
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    # Resize the image to 768x512
+    target_size = (768, 512)  # (width, height)
+    img = img.resize(target_size)
+    print(f"Resized Image size: {img.size}")
     transform = transforms.ToTensor()
     img_tensor = transform(img).unsqueeze(0) #[1, C, H, W]
+    print(f"Image tensor shape: {img_tensor.shape}")
     return img_tensor
 
 def parse_args(argv):
@@ -152,7 +164,7 @@ def main(argv):
         torch.backends.cudnn.benchmark = False
         np.random.seed(args.seed)
 
-    logwriter = LogWriter(Path(f"./checkpoints/{args.data_name}/{args.iterations}_{args.num_points}"))
+    logwriter = LogWriter(Path(f"./checkpoints/{args.data_name}/iter{args.iterations}_pts{args.num_points}"))
     psnrs, ms_ssims, training_times, eval_times, eval_fpses = [], [], [], [], []
     image_h, image_w = 0, 0
     # if args.data_name == "kodak":
