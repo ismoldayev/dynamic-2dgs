@@ -110,8 +110,9 @@ def image_path_to_tensor(image_path: Path):
     if img.mode != "RGB":
         img = img.convert("RGB")
 
-    # Resize the image to 768x512
-    target_size = (768, 512)  # (width, height)
+    # Resize the image
+    scale = math.sqrt(1024 / (img.size[0] * img.size[1]))
+    target_size = (int(img.size[0] * scale) * 16, int(img.size[1] * scale) * 16)  # (width, height) = (768, 512)
     img = img.resize(target_size)
     print(f"Resized Image size: {img.size}")
     transform = transforms.ToTensor()

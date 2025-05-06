@@ -467,7 +467,7 @@ __global__ void rasterize_video_forward(
             const float sigma = 0.5f * (conic.x * delta.x * delta.x +
                                         conic.z * delta.y * delta.y) +
                                 conic.y * delta.x * delta.y;
-        
+
             const float decay = 0.5 * time_params.x * delta.z * delta.z;
             const float alpha = min(0.999f, opac * __expf(-sigma-decay));
             if (sigma < 0.f || alpha < 1.f / 255.f || decay > vis_thresold) {
