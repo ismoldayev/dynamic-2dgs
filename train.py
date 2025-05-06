@@ -46,8 +46,13 @@ class VideoTrainer:
         BLOCK_H, BLOCK_W = 16, 16 # Keep block size fixed for now
         self.iterations = iterations
         self.save_frames = args.save_frames
-        # Adjust log directory naming for video
-        self.log_dir = Path(f"./checkpoints/{self.video_name}/iter{args.iterations}_pts{num_points}_frames{self.T}")
+        # Adjust log directory naming for video, include lambda_opacity_reg
+        opacity_reg_str = f"_opReg{args.lambda_opacity_reg:.0e}".replace("e-0", "e-") # Format like 1e-4
+        temporal_xyz_str = f"_tempXYZ{args.lambda_temporal_xyz:.0e}".replace("e-0", "e-")
+        temporal_chol_str = f"_tempChol{args.lambda_temporal_cholesky:.0e}".replace("e-0", "e-")
+
+        # Add more params to log_dir name for better tracking
+        self.log_dir = Path(f"./checkpoints/{self.video_name}/iter{args.iterations}_pts{num_points}_frames{self.T}{opacity_reg_str}{temporal_xyz_str}{temporal_chol_str}_lr{args.lr:.0e}")
         self.log_dir.mkdir(parents=True, exist_ok=True)
         print(f"Logging to: {self.log_dir}")
 
@@ -103,15 +108,16 @@ class VideoTrainer:
                 progress_bar.update(10)
 
             # --- Periodic Evaluation and Saving ---
+            # Also save model checkpoint here if it's a periodic eval iteration
             if iter_idx % 10000 == 0 and iter_idx != self.iterations: # Avoid double saving on last iteration
-                self.evaluate_and_save_output(iter_idx)
+                self.evaluate_and_save_output(iter_idx, save_checkpoint=True)
             # --- End Periodic Saving ---
 
         end_time = time.time() - start_time
         progress_bar.close()
 
-        # Run final evaluation and save final output
-        final_psnr, final_ms_ssim = self.evaluate_and_save_output(self.iterations)
+        # Run final evaluation and save final output (including final checkpoint)
+        final_psnr, final_ms_ssim = self.evaluate_and_save_output(self.iterations, save_checkpoint=True)
 
         # Measure rendering speed (average over frames)
         self.gaussian_model.eval()
@@ -127,10 +133,11 @@ class VideoTrainer:
         self.logwriter.write(f"Final Avg PSNR: {final_psnr:.4f}, Avg MS-SSIM: {final_ms_ssim:.6f}")
         self.logwriter.write(f"Avg Frame Render time: {test_end_time:.8f}s, FPS: {1/test_end_time:.4f}")
 
-        # Save model and training log
-        model_save_path = self.log_dir / "gaussian_model_final.pth.tar"
-        torch.save(self.gaussian_model.state_dict(), model_save_path)
-        print(f"Model saved to {model_save_path}")
+        # Save model and training log (This will now be the *final* model save, periodic ones are in evaluate_and_save_output)
+        # model_save_path = self.log_dir / "gaussian_model_final.pth.tar"
+        # torch.save(self.gaussian_model.state_dict(), model_save_path)
+        # print(f"Model saved to {model_save_path}")
+        # The above lines are now handled by the last call to evaluate_and_save_output(self.iterations, save_checkpoint=True)
 
         training_log_path = self.log_dir / "training_log.npy"
         np.save(training_log_path, {
@@ -148,14 +155,35 @@ class VideoTrainer:
         return final_psnr, final_ms_ssim, end_time, test_end_time, 1/test_end_time
 
     # --- Refactored Evaluation and Saving Logic ---
-    def evaluate_and_save_output(self, iteration):
-        """Renders frames, calculates metrics, and saves PNGs/video for a specific iteration."""
+    def evaluate_and_save_output(self, iteration, save_checkpoint=False):
+        """Renders frames, calculates metrics, and saves PNGs/video for a specific iteration.
+        Optionally saves a model checkpoint.
+        """
         print(f"\n--- Evaluating and Saving Output for Iteration {iteration} ---")
         self.gaussian_model.eval() # Set model to evaluation mode
 
         total_psnr = 0
         total_ms_ssim = 0
         saved_frame_paths = []
+
+        # --- TEMPORARY OPACITY ANALYSIS ---
+        with torch.no_grad():
+            current_opacities = self.gaussian_model.get_opacity.detach().cpu().numpy().flatten()
+            print(f"\n--- Opacity Analysis at Iteration {iteration} ---")
+            print(f"Number of Gaussians: {len(current_opacities)}")
+            if len(current_opacities) > 0:
+                print(f"Min opacity: {np.min(current_opacities):.6f}")
+                print(f"Max opacity: {np.max(current_opacities):.6f}")
+                print(f"Mean opacity: {np.mean(current_opacities):.6f}")
+                print(f"Median opacity: {np.median(current_opacities):.6f}")
+                percentiles_to_check = [1, 5, 10, 25, 50, 75, 90, 95, 99]
+                opacity_percentiles = np.percentile(current_opacities, percentiles_to_check)
+                for p, v in zip(percentiles_to_check, opacity_percentiles):
+                    print(f"{p}th percentile: {v:.6f}")
+            else:
+                print("No Gaussians to analyze (num_points might be 0 if pruned aggressively).")
+        print("--- End Opacity Analysis ---\n")
+        # --- END TEMPORARY OPACITY ANALYSIS ---
 
         with torch.no_grad():
             # Render all frames at once
@@ -214,6 +242,13 @@ class VideoTrainer:
             if self.save_frames and video_writer is not None:
                 video_writer.release()
                 print(f"Finished saving output for iteration {iteration}.")
+
+        # --- Save Model Checkpoint if requested ---
+        if save_checkpoint:
+            checkpoint_save_path = self.log_dir / f"gaussian_model_iter_{iteration}.pth.tar"
+            torch.save(self.gaussian_model.state_dict(), checkpoint_save_path)
+            print(f"Model checkpoint saved to {checkpoint_save_path}")
+        # --- End Save Model Checkpoint ---
 
         avg_psnr = total_psnr / self.T
         avg_ms_ssim = total_ms_ssim / self.T
