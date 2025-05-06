@@ -60,7 +60,10 @@ class VideoTrainer:
             BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W,
             device=self.device,
             lr=args.lr,
-            opt_type=args.opt_type
+            opt_type=args.opt_type,
+            lambda_opacity_reg=args.lambda_opacity_reg,
+            lambda_temporal_xyz=args.lambda_temporal_xyz,
+            lambda_temporal_cholesky=args.lambda_temporal_cholesky
         ).to(self.device)
 
         self.logwriter = LogWriter(self.log_dir)
@@ -270,6 +273,9 @@ def parse_args(argv):
     parser.add_argument("--seed", type=int, default=42, help="Set random seed for reproducibility (default: %(default)s)")
     parser.add_argument("--no_save_frames", action="store_false", dest="save_frames", help="Do not save rendered frames/video (default is to save)")
     parser.add_argument("--output_fps", type=int, default=25, help="FPS for the output video if saving is enabled (default: %(default)s)")
+    parser.add_argument("--lambda_opacity_reg", type=float, default=1e-4, help="Strength of L1 opacity regularization (default: %(default)s)")
+    parser.add_argument("--lambda_temporal_xyz", type=float, default=0.1, help="Strength of temporal consistency loss for XYZ (default: %(default)s)")
+    parser.add_argument("--lambda_temporal_cholesky", type=float, default=0.1, help="Strength of temporal consistency loss for Cholesky (default: %(default)s)")
     # parser.add_argument("--sh_degree", type=int, default=0, help="SH degree (Not used in this 2D version, default: %(default)s)") # SH degree is irrelevant for 2D
 
     # Remove old/unused arguments

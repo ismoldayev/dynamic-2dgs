@@ -148,26 +148,50 @@ def video_path_to_tensor(video_path, num_frames=None, target_size=None):
     Returns:
         torch.Tensor: Tensor containing video frames of shape (T, C, H, W).
     """
-    # Get rotation metadata *before* reading frames
-    rotation_angle = get_video_rotation(video_path)
+    # Get rotation and accurate frame count using ffprobe
+    rotation_angle, ffprobe_total_frames = get_video_properties_ffprobe(video_path)
+
+    if ffprobe_total_frames is None:
+        # Fallback to OpenCV if ffprobe fails for frame count, though it might be inaccurate
+        print("Warning: ffprobe failed to get frame count. Falling back to OpenCV for frame count (may be inaccurate).")
+        cap_for_count = cv2.VideoCapture(str(video_path))
+        if not cap_for_count.isOpened():
+            raise IOError(f"Cannot open video file for count: {video_path}")
+        opencv_total_frames = int(cap_for_count.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap_for_count.release()
+        total_frames = opencv_total_frames
+        if total_frames <= 0: # Further check if OpenCV also fails badly
+            raise ValueError(f"Could not determine a valid frame count for {video_path}")
+    else:
+        total_frames = ffprobe_total_frames
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise IOError(f"Cannot open video file: {video_path}")
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    # Get OpenCV reported FPS for reference, but total_frames is now from ffprobe (more reliable)
     video_fps = cap.get(cv2.CAP_PROP_FPS)
-    print(f"Video Properties: Total Frames = {total_frames}, FPS = {video_fps:.2f}")
+    print(f"Video Properties: Total Frames (reliable) = {total_frames}, OpenCV FPS = {video_fps:.2f}")
 
     frames_to_capture = total_frames
     selected_indices = None
 
     if num_frames is not None and num_frames < total_frames:
         print(f"Selecting {num_frames} frames evenly spaced from {total_frames} total frames.")
-        # Generate num_frames evenly spaced indices between 0 and total_frames - 1
-        indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
-        selected_indices = set(indices)
-        frames_to_capture = len(selected_indices) # Should be equal to num_frames
+        # Generate num_frames evenly spaced indices
+        # Ensure indices are within the valid range [0, total_frames - 1]
+        indices = np.floor(np.linspace(0, total_frames -1 - 1e-9, num_frames)).astype(int)
+        # An alternative, often more robust method for selecting N frames from V:
+        # indices = [int(i * total_frames / num_frames) for i in range(num_frames)]
+        # However, linspace (with safety for endpoint) should also work well if total_frames is accurate.
+        # To be extra safe, clip values just in case of any float precision issues:
+        indices = np.clip(indices, 0, total_frames - 1)
+
+        selected_indices = set(indices) # Use set to ensure uniqueness if any rounding produced duplicates
+        frames_to_capture = len(selected_indices)
+
+        if frames_to_capture < num_frames:
+            print(f"Warning: Expected to select {num_frames} frames, but only got {frames_to_capture} unique indices. This might be due to rounding or video length.")
         print(f"Selected frame indices: {sorted(list(selected_indices))}")
     elif num_frames is not None:
         print(f"Requested {num_frames} frames, but video only has {total_frames}. Using all frames.")
@@ -244,14 +268,19 @@ def video_path_to_tensor(video_path, num_frames=None, target_size=None):
     print(f"Final video tensor shape: {video_tensor.shape}") # Should match frames_to_capture
     return video_tensor
 
-def get_video_rotation(video_path):
-    """Uses ffprobe to get the rotation metadata from a video file.
+def get_video_properties_ffprobe(video_path):
+    """Uses ffprobe to get rotation and accurate frame count from a video file.
 
     Returns:
-        int: Rotation angle (0, 90, 180, 270) or 0 if not found/error.
+        tuple: (rotation_angle, frame_count)
+               rotation_angle is int (0, 90, 180, 270) or 0 if not found/error.
+               frame_count is int or None if error.
     """
+    rotation_angle = 0
+    frame_count = None
     try:
-        cmd = [
+        # Get rotation
+        cmd_rotate = [
             'ffprobe',
             '-loglevel', 'error',
             '-select_streams', 'v:0',
@@ -259,22 +288,39 @@ def get_video_rotation(video_path):
             '-of', 'default=nw=1:nk=1',
             str(video_path)
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        rotation = int(result.stdout.strip())
-        if rotation in [0, 90, 180, 270]:
-            print(f"Detected video rotation: {rotation} degrees")
-            return rotation
+        result_rotate = subprocess.run(cmd_rotate, capture_output=True, text=True, check=False) # check=False to handle missing tag gracefully
+        if result_rotate.returncode == 0 and result_rotate.stdout.strip():
+            try:
+                angle = int(result_rotate.stdout.strip())
+                if angle in [0, 90, 180, 270]:
+                    rotation_angle = angle
+                    print(f"Detected video rotation (ffprobe): {rotation_angle} degrees")
+                else:
+                    print(f"Warning: Unexpected rotation value {angle} from ffprobe. Assuming 0.")
+            except ValueError:
+                print("Warning: Could not parse rotation value from ffprobe. Assuming 0.")
         else:
-            print(f"Warning: Unexpected rotation value {rotation} found. Assuming 0.")
-            return 0
+            print("Info: No rotation tag found or ffprobe error for rotation. Assuming 0 rotation.")
+
+        # Get frame count
+        cmd_frames = [
+            'ffprobe',
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-count_frames',
+            '-show_entries', 'stream=nb_read_frames',
+            '-of', 'default=nokey=1:noprint_wrappers=1',
+            str(video_path)
+        ]
+        result_frames = subprocess.run(cmd_frames, capture_output=True, text=True, check=True)
+        frame_count = int(result_frames.stdout.strip())
+        print(f"Detected frame count (ffprobe): {frame_count}")
+
     except FileNotFoundError:
-        print("Warning: ffprobe command not found. Cannot check video rotation. Assuming 0.")
-        return 0
+        print("ERROR: ffprobe command not found. Cannot get accurate video properties.")
     except subprocess.CalledProcessError as e:
-        # ffprobe might return error if 'rotate' tag doesn't exist
-        print(f"Warning: ffprobe failed (possibly no rotation tag). Assuming 0 rotation. Error: {e}")
-        return 0
+        print(f"ERROR: ffprobe failed to get frame count. Error: {e}")
     except ValueError:
-        # Handle case where output is not an integer
-        print("Warning: Could not parse rotation value from ffprobe. Assuming 0.")
-        return 0
+        print("ERROR: Could not parse frame count from ffprobe.")
+
+    return rotation_angle, frame_count

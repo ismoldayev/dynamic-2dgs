@@ -9,12 +9,15 @@ import math
 from optimizer import Adan
 
 class GaussianImage_Cholesky(nn.Module):
-    def __init__(self, loss_type="L2", T=1, **kwargs):
+    def __init__(self, loss_type="L2", T=1, lambda_opacity_reg=0.0, lambda_temporal_xyz=0.0, lambda_temporal_cholesky=0.0, **kwargs):
         super().__init__()
         self.loss_type = loss_type
         self.num_points = kwargs["num_points"]
         self.H, self.W = kwargs["H"], kwargs["W"]
         self.T = T # Number of frames
+        self.lambda_opacity_reg = lambda_opacity_reg
+        self.lambda_temporal_xyz = lambda_temporal_xyz
+        self.lambda_temporal_cholesky = lambda_temporal_cholesky
         self.BLOCK_W, self.BLOCK_H = kwargs["BLOCK_W"], kwargs["BLOCK_H"]
         self.tile_bounds = (
             (self.W + self.BLOCK_W - 1) // self.BLOCK_W,
@@ -34,7 +37,7 @@ class GaussianImage_Cholesky(nn.Module):
         self._features_dc = nn.Parameter(torch.rand(self.num_points, 3, device=self.device))
 
         self.last_size = (self.H, self.W)
-        self.register_buffer('background', torch.ones(3, device=self.device))
+        self.register_buffer('background', torch.zeros(3, device=self.device))
         self.opacity_activation = torch.sigmoid
         self.rgb_activation = torch.sigmoid
         # self.register_buffer('bound', torch.tensor([0.5, 0.5]).view(1, 2).to(self.device)) # Not used?
@@ -143,6 +146,28 @@ class GaussianImage_Cholesky(nn.Module):
 
         average_loss = total_loss / self.T
         average_psnr = total_psnr / self.T
+
+        # Add L1 opacity regularization
+        # We penalize the raw logits _opacity to encourage them to be negative (pushing sigmoid towards 0)
+        # Or, penalize the output of get_opacity directly (simpler to reason about scale)
+        if self.lambda_opacity_reg > 0:
+            opacity_values = self.get_opacity # These are already sigmoid-ed
+            opacity_reg_loss = self.lambda_opacity_reg * torch.mean(opacity_values)
+            average_loss += opacity_reg_loss
+
+        # Add temporal consistency regularization for XYZ
+        if self.lambda_temporal_xyz > 0 and self.T > 1:
+            xyz_params = self.get_xyz # Shape (T, N, 2)
+            xyz_diff = xyz_params[1:] - xyz_params[:-1] # Differences between frame t and t-1
+            temporal_xyz_loss = self.lambda_temporal_xyz * torch.mean(xyz_diff**2)
+            average_loss += temporal_xyz_loss
+
+        # Add temporal consistency regularization for Cholesky components
+        if self.lambda_temporal_cholesky > 0 and self.T > 1:
+            cholesky_params = self.get_cholesky_elements # Shape (T, N, 3)
+            cholesky_diff = cholesky_params[1:] - cholesky_params[:-1]
+            temporal_cholesky_loss = self.lambda_temporal_cholesky * torch.mean(cholesky_diff**2)
+            average_loss += temporal_cholesky_loss
 
         # Backpropagate the average loss
         self.optimizer.zero_grad()
