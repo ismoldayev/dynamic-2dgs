@@ -3,6 +3,14 @@ import torch.nn.functional as F
 from pytorch_msssim import ms_ssim, ssim
 import torch
 import numpy as np
+# Add imports for video processing
+import cv2
+import math
+from PIL import Image
+import torchvision.transforms as transforms
+# Add subprocess for ffprobe
+import subprocess
+import json
 
 class LogWriter:
     def __init__(self, file_path, train=True):
@@ -35,6 +43,8 @@ def loss_fn(pred, target, loss_type='L2', lambda_value=0.7):
         loss = lambda_value * F.l1_loss(pred, target) + (1-lambda_value) * (1 - ms_ssim(pred, target, data_range=1, size_average=True))
     elif loss_type == 'Fusion_hinerv':
         loss = lambda_value * F.l1_loss(pred, target) + (1-lambda_value)  * (1 - ms_ssim(pred, target, data_range=1, size_average=True, win_size=5))
+    else:
+        raise ValueError(f"Unknown loss type: {loss_type}")
     return loss
 
 # def strip_lowerdiag(L):
@@ -124,3 +134,147 @@ def build_triangular(r):
     R[:, 1, 0] = r[:, 1]
     R[:, 1, 1] = r[:, 2]
     return R
+
+def video_path_to_tensor(video_path, num_frames=None, target_size=None):
+    """Reads frames from a video file, resizes them, and returns a tensor.
+
+    Args:
+        video_path (str): Path to the video file.
+        num_frames (int, optional): Number of frames to read. Reads all if None.
+        target_size (tuple, optional): Target size (width, height). If None,
+                                     resizes based on a heuristic similar to
+                                     the original image processing.
+
+    Returns:
+        torch.Tensor: Tensor containing video frames of shape (T, C, H, W).
+    """
+    # Get rotation metadata *before* reading frames
+    rotation_angle = get_video_rotation(video_path)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise IOError(f"Cannot open video file: {video_path}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"Video Properties: Total Frames = {total_frames}, FPS = {video_fps:.2f}")
+
+    frames_to_capture = total_frames
+    selected_indices = None
+
+    if num_frames is not None and num_frames < total_frames:
+        print(f"Selecting {num_frames} frames evenly spaced from {total_frames} total frames.")
+        # Generate num_frames evenly spaced indices between 0 and total_frames - 1
+        indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+        selected_indices = set(indices)
+        frames_to_capture = len(selected_indices) # Should be equal to num_frames
+        print(f"Selected frame indices: {sorted(list(selected_indices))}")
+    elif num_frames is not None:
+        print(f"Requested {num_frames} frames, but video only has {total_frames}. Using all frames.")
+        # If user requested more frames than available, just use all of them.
+        num_frames = total_frames # Update num_frames to actual count
+        # No need to select indices, will capture all
+    else:
+        # num_frames was None, use all frames
+        num_frames = total_frames
+        print(f"Processing all {total_frames} frames.")
+        # No need to select indices
+
+    frames = []
+    processed_frame_count = 0
+    current_frame_index = 0
+    original_w, original_h = None, None
+
+    while processed_frame_count < frames_to_capture:
+        ret, frame = cap.read()
+        if not ret:
+            print(f"Warning: Could not read frame {current_frame_index} or end of video reached early.")
+            break
+
+        # Check if we need to select this frame
+        should_process_frame = (selected_indices is None) or (current_frame_index in selected_indices)
+
+        if should_process_frame:
+
+            # --- Apply rotation if needed ---
+            if rotation_angle == 90:
+                frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            elif rotation_angle == 180:
+                frame = cv2.rotate(frame, cv2.ROTATE_180)
+            elif rotation_angle == 270:
+                frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            # --- End rotation ---
+
+            # Convert BGR (OpenCV default) to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame_rgb)
+
+            if processed_frame_count == 0: # First frame *being processed*
+                original_w, original_h = img.size
+                print(f"Original Frame size: ({original_w}, {original_h})")
+                if target_size is None:
+                    # Heuristic resizing similar to original code
+                    scale = math.sqrt((1024 * 1024) / (original_w * original_h)) if (original_w * original_h > 0) else 1.0
+                    target_w = max(16, int(round(original_w * scale / 16)) * 16)
+                    target_h = max(16, int(round(original_h * scale / 16)) * 16)
+                    current_target_size = (target_w, target_h)
+                    print(f"Resizing selected frames to: {current_target_size}")
+                else:
+                    current_target_size = target_size
+                    print(f"Using provided target size: {current_target_size}")
+
+            # Resize image
+            img_resized = img.resize(current_target_size)
+
+            # Convert to tensor
+            transform = transforms.ToTensor() # Scales to [0, 1]
+            img_tensor = transform(img_resized) # Shape (C, H, W)
+            frames.append(img_tensor)
+            processed_frame_count += 1
+
+        current_frame_index += 1
+
+    cap.release()
+
+    if not frames:
+        raise ValueError(f"Could not read any frames from {video_path} (or no frames selected)")
+
+    # Stack frames into a single tensor (T, C, H, W)
+    video_tensor = torch.stack(frames)
+    print(f"Final video tensor shape: {video_tensor.shape}") # Should match frames_to_capture
+    return video_tensor
+
+def get_video_rotation(video_path):
+    """Uses ffprobe to get the rotation metadata from a video file.
+
+    Returns:
+        int: Rotation angle (0, 90, 180, 270) or 0 if not found/error.
+    """
+    try:
+        cmd = [
+            'ffprobe',
+            '-loglevel', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream_tags=rotate',
+            '-of', 'default=nw=1:nk=1',
+            str(video_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        rotation = int(result.stdout.strip())
+        if rotation in [0, 90, 180, 270]:
+            print(f"Detected video rotation: {rotation} degrees")
+            return rotation
+        else:
+            print(f"Warning: Unexpected rotation value {rotation} found. Assuming 0.")
+            return 0
+    except FileNotFoundError:
+        print("Warning: ffprobe command not found. Cannot check video rotation. Assuming 0.")
+        return 0
+    except subprocess.CalledProcessError as e:
+        # ffprobe might return error if 'rotate' tag doesn't exist
+        print(f"Warning: ffprobe failed (possibly no rotation tag). Assuming 0 rotation. Error: {e}")
+        return 0
+    except ValueError:
+        # Handle case where output is not an integer
+        print("Warning: Could not parse rotation value from ffprobe. Assuming 0.")
+        return 0

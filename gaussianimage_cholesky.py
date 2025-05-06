@@ -9,11 +9,12 @@ import math
 from optimizer import Adan
 
 class GaussianImage_Cholesky(nn.Module):
-    def __init__(self, loss_type="L2", **kwargs):
+    def __init__(self, loss_type="L2", T=1, **kwargs):
         super().__init__()
         self.loss_type = loss_type
-        self.init_num_points = kwargs["num_points"]
+        self.num_points = kwargs["num_points"]
         self.H, self.W = kwargs["H"], kwargs["W"]
+        self.T = T # Number of frames
         self.BLOCK_W, self.BLOCK_H = kwargs["BLOCK_W"], kwargs["BLOCK_H"]
         self.tile_bounds = (
             (self.W + self.BLOCK_W - 1) // self.BLOCK_W,
@@ -22,16 +23,22 @@ class GaussianImage_Cholesky(nn.Module):
         ) #
         self.device = kwargs["device"]
 
-        self._xyz = nn.Parameter(torch.atanh(2 * (torch.rand(self.init_num_points, 2) - 0.5)))
-        self._cholesky = nn.Parameter(torch.rand(self.init_num_points, 3))
-        self.register_buffer('_opacity', torch.ones((self.init_num_points, 1)))
-        self._features_dc = nn.Parameter(torch.rand(self.init_num_points, 3))
+        # Time-varying parameters: shape (T, N, ...)
+        self._xyz = nn.Parameter(torch.atanh(2 * (torch.rand(self.T, self.num_points, 2, device=self.device) - 0.5)))
+        # Initialize cholesky near identity (small off-diag, positive diag)
+        init_chol = torch.tensor([1.0, 0.0, 1.0], device=self.device).view(1, 1, 3)
+        self._cholesky = nn.Parameter(init_chol.repeat(self.T, self.num_points, 1) + torch.randn(self.T, self.num_points, 3, device=self.device) * 0.01)
+
+        # Static parameters: shape (N, ...)
+        self._opacity = nn.Parameter(torch.ones((self.num_points, 1), device=self.device))
+        self._features_dc = nn.Parameter(torch.rand(self.num_points, 3, device=self.device))
+
         self.last_size = (self.H, self.W)
-        self.register_buffer('background', torch.ones(3))
+        self.register_buffer('background', torch.ones(3, device=self.device))
         self.opacity_activation = torch.sigmoid
         self.rgb_activation = torch.sigmoid
-        self.register_buffer('bound', torch.tensor([0.5, 0.5]).view(1, 2))
-        self.register_buffer('cholesky_bound', torch.tensor([0.5, 0, 0.5]).view(1, 3))
+        # self.register_buffer('bound', torch.tensor([0.5, 0.5]).view(1, 2).to(self.device)) # Not used?
+        self.register_buffer('cholesky_bound', torch.tensor([0.5, 0, 0.5]).view(1, 1, 3).to(self.device)) # Adjusted shape for broadcasting
 
         if kwargs["opt_type"] == "adam":
             self.optimizer = torch.optim.Adam(self.parameters(), lr=kwargs["lr"])
@@ -44,41 +51,106 @@ class GaussianImage_Cholesky(nn.Module):
 
     @property
     def get_xyz(self):
+        """Returns means for all frames, shape (T, N, 2)."""
         return torch.tanh(self._xyz)
 
     @property
     def get_features(self):
-        return self._features_dc
+        """Returns colors, shape (N, 3)."""
+        # Apply activation
+        return self.rgb_activation(self._features_dc)
 
     @property
     def get_opacity(self):
-        return self._opacity
+        """Returns opacities, shape (N, 1)."""
+        # Apply activation
+        return self.opacity_activation(self._opacity)
 
     @property
     def get_cholesky_elements(self):
-        return self._cholesky+self.cholesky_bound
+        """Returns Cholesky elements for all frames, shape (T, N, 3)."""
+        # Add bound - Note: This was likely for initialization constraints, may need adjustment.
+        # Ensure cholesky_bound broadcasts correctly: (1, 1, 3)
+        return self._cholesky + self.cholesky_bound
 
-    def forward(self):
-        self.xys, depths, self.radii, conics, num_tiles_hit = project_gaussians_2d(self.get_xyz, self.get_cholesky_elements, self.H, self.W, self.tile_bounds)
-        out_img = rasterize_gaussians_sum(self.xys, depths, self.radii, conics, num_tiles_hit,
-                self.get_features, self._opacity, self.H, self.W, self.BLOCK_H, self.BLOCK_W, background=self.background, return_alpha=False)
-        out_img = torch.clamp(out_img, 0, 1) #[H, W, 3]
-        out_img = out_img.view(-1, self.H, self.W, 3).permute(0, 3, 1, 2).contiguous()
-        return {"render": out_img}
+    def forward(self, frame_index=None):
+        """Render either a specific frame or all frames.
 
-    def train_iter(self, gt_image):
-        render_pkg = self.forward()
-        image = render_pkg["render"]
-        loss = loss_fn(image, gt_image, self.loss_type, lambda_value=0.7)
-        loss.backward()
-        with torch.no_grad():
-            mse_loss = F.mse_loss(image, gt_image)
-            psnr = 10 * math.log10(1.0 / mse_loss.item())
+        Args:
+            frame_index (int, optional): If specified, render only this frame.
+                                       Otherwise, render all frames.
+
+        Returns:
+            dict: Dictionary containing the rendered image(s).
+                  If frame_index is given, "render" has shape (1, C, H, W).
+                  Otherwise, "render" has shape (T, C, H, W).
+        """
+        if frame_index is not None:
+            # Render a single frame t
+            means_t = self.get_xyz[frame_index] # (N, 2)
+            cholesky_t = self.get_cholesky_elements[frame_index] # (N, 3)
+            colors = self.get_features # (N, 3)
+            opacities = self.get_opacity # (N, 1)
+
+            # gsplat expects N x D input, project_gaussians_2d takes means and cholesky separately
+            xys, depths, radii, conics, num_tiles_hit = project_gaussians_2d(
+                means_t, cholesky_t, self.H, self.W, self.tile_bounds
+            )
+            # rasterize_gaussians_sum expects N x D input for colors and opacities
+            out_img = rasterize_gaussians_sum(
+                xys, depths, radii, conics, num_tiles_hit,
+                colors, opacities, self.H, self.W, self.BLOCK_H, self.BLOCK_W,
+                background=self.background, return_alpha=False
+            )
+            out_img = torch.clamp(out_img, 0, 1) #[H, W, 3]
+            # Reshape to (1, C, H, W)
+            out_img = out_img.view(1, self.H, self.W, 3).permute(0, 3, 1, 2).contiguous()
+            return {"render": out_img}
+        else:
+            # Render all frames (can be memory intensive)
+            all_frames_rendered = []
+            for t in range(self.T):
+                frame_render_pkg = self.forward(frame_index=t)
+                all_frames_rendered.append(frame_render_pkg["render"])
+            # Stack along the time dimension
+            all_frames_tensor = torch.cat(all_frames_rendered, dim=0) # (T, C, H, W)
+            return {"render": all_frames_tensor}
+
+    def train_iter(self, gt_frames):
+        """Performs one training iteration using all frames.
+
+        Args:
+            gt_frames (torch.Tensor): Ground truth video frames (T, C, H, W).
+
+        Returns:
+            tuple: Average loss and average PSNR across all frames.
+        """
+        total_loss = 0
+        total_psnr = 0
+
+        # Render all frames
+        rendered_frames_pkg = self.forward() # Gets dict with "render": (T, C, H, W)
+        rendered_frames = rendered_frames_pkg["render"]
+
+        # Calculate loss and PSNR per frame and average
+        for t in range(self.T):
+            loss_t = loss_fn(rendered_frames[t:t+1], gt_frames[t:t+1], self.loss_type, lambda_value=0.7)
+            total_loss += loss_t
+            with torch.no_grad():
+                mse_loss_t = F.mse_loss(rendered_frames[t:t+1], gt_frames[t:t+1])
+                psnr_t = 10 * math.log10(1.0 / mse_loss_t.item())
+                total_psnr += psnr_t
+
+        average_loss = total_loss / self.T
+        average_psnr = total_psnr / self.T
+
+        # Backpropagate the average loss
+        self.optimizer.zero_grad()
+        average_loss.backward()
         self.optimizer.step()
-        self.optimizer.zero_grad(set_to_none = True)
-
         self.scheduler.step()
-        return loss, psnr
+
+        return average_loss, average_psnr
 
     # def forward_quantize(self):
     #     l_vqm, m_bit = 0, 16*self.init_num_points*2

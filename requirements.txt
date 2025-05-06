@@ -8,3 +8,7 @@ tqdm
 vector-quantize-pytorch
 jaxtyping
 Ninja
+# Add opencv for video loading
+opencv-python
+einops
+# gsplat @ git+https://github.com/hbb1/gsplat@main

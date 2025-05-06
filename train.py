@@ -1,6 +1,7 @@
 """
-CUDA_VISIBLE_DEVICES=0 python train.py -d $data_path \
---data_name kodak --num_points 9000 --iterations 50000
+Example command:
+CUDA_VISIBLE_DEVICES=0 python train.py --video_path ./dynamic-2dgs/dataset/your_video.mp4 \
+--num_frames 20 --num_points 5000 --iterations 30000 --lr 1e-3
 """
 
 import math
@@ -11,144 +12,270 @@ import yaml
 import numpy as np
 import torch
 import sys
-from PIL import Image
+# from PIL import Image # Moved to utils
 import torch.nn.functional as F
 from pytorch_msssim import ms_ssim
 from utils import *
 from tqdm import tqdm
 import random
 import torchvision.transforms as transforms
+# Import the updated model
+from gaussianimage_cholesky import GaussianImage_Cholesky
+# Import cv2 for video writing
+import cv2
 
-class SimpleTrainer2d:
-    """Trains random 2d gaussians to fit an image."""
+# Renamed Trainer class
+class VideoTrainer:
+    """Trains dynamic 2d gaussians to fit video frames."""
     def __init__(
         self,
-        image_path: Path,
+        gt_frames: torch.Tensor, # Expecting (T, C, H, W)
+        video_path: Path,
         num_points: int = 2000,
         iterations:int = 30000,
         model_path = None,
         args = None,
     ):
-        self.device = torch.device("cuda:0")
-        self.gt_image = image_path_to_tensor(image_path).to(self.device)
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+        self.gt_frames = gt_frames.to(self.device)
+        self.T, self.C, self.H, self.W = self.gt_frames.shape
 
         self.num_points = num_points
-        image_path = Path(image_path)
-        self.image_name = image_path.stem
-        BLOCK_H, BLOCK_W = 16, 16
-        self.H, self.W = self.gt_image.shape[2], self.gt_image.shape[3]
+        self.video_name = video_path.stem
+        BLOCK_H, BLOCK_W = 16, 16 # Keep block size fixed for now
         self.iterations = iterations
-        self.save_imgs = args.save_imgs
-        self.log_dir = Path(f"./checkpoints/{args.data_name}/iter{args.iterations}_pts{num_points}/{self.image_name}")
+        self.save_frames = args.save_frames
+        # Adjust log directory naming for video
+        self.log_dir = Path(f"./checkpoints/{self.video_name}/iter{args.iterations}_pts{num_points}_frames{self.T}")
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Logging to: {self.log_dir}")
 
-
-        from gaussianimage_cholesky import GaussianImage_Cholesky
-        self.gaussian_model = GaussianImage_Cholesky(loss_type="L2", opt_type="adan", num_points=self.num_points, H=self.H, W=self.W, BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W,
-            device=self.device, lr=args.lr).to(self.device)
+        # Instantiate the updated Gaussian model with T frames
+        self.gaussian_model = GaussianImage_Cholesky(
+            loss_type="L2",
+            T=self.T,
+            num_points=self.num_points,
+            H=self.H, W=self.W,
+            BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W,
+            device=self.device,
+            lr=args.lr,
+            opt_type=args.opt_type
+        ).to(self.device)
 
         self.logwriter = LogWriter(self.log_dir)
 
+        # Store output fps for video writing
+        self.output_fps = args.output_fps
+
         if model_path is not None:
-            print(f"loading model path:{model_path}")
-            checkpoint = torch.load(model_path, map_location=self.device)
-            model_dict = self.gaussian_model.state_dict()
-            pretrained_dict = {k: v for k, v in checkpoint.items() if k in model_dict}
-            model_dict.update(pretrained_dict)
-            self.gaussian_model.load_state_dict(model_dict)
+            print(f"Loading model path: {model_path}")
+            # Note: Loading checkpoints might require adjustments if the parameter shapes changed (e.g., _xyz, _cholesky)
+            # This basic loading might only work if resuming a video training session.
+            # For loading a single-image checkpoint, more logic would be needed to initialize time-varying params.
+            try:
+                checkpoint = torch.load(model_path, map_location=self.device)
+                self.gaussian_model.load_state_dict(checkpoint, strict=False)
+                print("Model loaded successfully.")
+            except Exception as e:
+                print(f"Could not load model checkpoint: {e}")
+                print("Starting training from scratch.")
 
     def train(self):
+        # psnr_list will store average PSNR per iteration
         psnr_list, iter_list = [], []
-        progress_bar = tqdm(range(1, self.iterations+1), desc="Training progress")
-        best_psnr = 0
+        progress_bar = tqdm(range(1, self.iterations + 1), desc="Training progress")
+
         self.gaussian_model.train()
         start_time = time.time()
-        for iter in range(1, self.iterations+1):
-            loss, psnr = self.gaussian_model.train_iter(self.gt_image)
-            psnr_list.append(psnr)
-            iter_list.append(iter)
-            with torch.no_grad():
-                if iter % 10 == 0:
-                    progress_bar.set_postfix({f"Loss":f"{loss.item():.{7}f}", "PSNR":f"{psnr:.{4}f},"})
-                    progress_bar.update(10)
+        for iter_idx in range(1, self.iterations + 1):
+            # train_iter now handles looping through frames and averaging loss/psnr
+            loss, psnr = self.gaussian_model.train_iter(self.gt_frames)
+
+            psnr_list.append(psnr) # Append average PSNR for this iteration
+            iter_list.append(iter_idx)
+
+            if iter_idx % 10 == 0:
+                progress_bar.set_postfix({f"Avg Loss":f"{loss.item():.{7}f}", "Avg PSNR":f"{psnr:.{4}f}"})
+                progress_bar.update(10)
+
+            # --- Periodic Evaluation and Saving ---
+            if iter_idx % 10000 == 0 and iter_idx != self.iterations: # Avoid double saving on last iteration
+                self.evaluate_and_save_output(iter_idx)
+            # --- End Periodic Saving ---
+
         end_time = time.time() - start_time
         progress_bar.close()
-        psnr_value, ms_ssim_value = self.test()
-        with torch.no_grad():
-            self.gaussian_model.eval()
-            test_start_time = time.time()
-            for i in range(100):
-                _ = self.gaussian_model()
-            test_end_time = (time.time() - test_start_time)/100
 
-        self.logwriter.write("Training Complete in {:.4f}s, Eval time:{:.8f}s, FPS:{:.4f}".format(end_time, test_end_time, 1/test_end_time))
-        torch.save(self.gaussian_model.state_dict(), self.log_dir / "gaussian_model.pth.tar")
-        np.save(self.log_dir / "training.npy", {"iterations": iter_list, "training_psnr": psnr_list, "training_time": end_time,
-        "psnr": psnr_value, "ms-ssim": ms_ssim_value, "rendering_time": test_end_time, "rendering_fps": 1/test_end_time})
-        return psnr_value, ms_ssim_value, end_time, test_end_time, 1/test_end_time
+        # Run final evaluation and save final output
+        final_psnr, final_ms_ssim = self.evaluate_and_save_output(self.iterations)
 
-    def test(self):
+        # Measure rendering speed (average over frames)
         self.gaussian_model.eval()
         with torch.no_grad():
-            out = self.gaussian_model()
-        mse_loss = F.mse_loss(out["render"].float(), self.gt_image.float())
-        psnr = 10 * math.log10(1.0 / mse_loss.item())
-        ms_ssim_value = ms_ssim(out["render"].float(), self.gt_image.float(), data_range=1, size_average=True).item()
-        self.logwriter.write("Test PSNR:{:.4f}, MS_SSIM:{:.6f}".format(psnr, ms_ssim_value))
-        if self.save_imgs:
-            transform = transforms.ToPILImage()
-            img = transform(out["render"].float().squeeze(0))
-            name = self.image_name + "_fitting.png"
-            img.save(str(self.log_dir / name))
-        return psnr, ms_ssim_value
+            test_start_time = time.time()
+            num_render_tests = min(10, self.T) # Render a few frames or all if T is small
+            for i in range(num_render_tests):
+                 # Render a single frame
+                _ = self.gaussian_model(frame_index=i % self.T)
+            test_end_time = (time.time() - test_start_time) / num_render_tests
 
-def image_path_to_tensor(image_path: Path):
-    img = Image.open(image_path)
-    print(f"image mode {img.mode}")
-    print(f"Original Image size: {img.size}, mode: {img.mode}")
+        self.logwriter.write(f"Training Complete in {end_time:.4f}s")
+        self.logwriter.write(f"Final Avg PSNR: {final_psnr:.4f}, Avg MS-SSIM: {final_ms_ssim:.6f}")
+        self.logwriter.write(f"Avg Frame Render time: {test_end_time:.8f}s, FPS: {1/test_end_time:.4f}")
 
-    # Ensure the image is in RGB mode
-    if img.mode != "RGB":
-        img = img.convert("RGB")
+        # Save model and training log
+        model_save_path = self.log_dir / "gaussian_model_final.pth.tar"
+        torch.save(self.gaussian_model.state_dict(), model_save_path)
+        print(f"Model saved to {model_save_path}")
 
-    # Resize the image
-    scale = math.sqrt(1024 / (img.size[0] * img.size[1]))
-    target_size = (int(img.size[0] * scale) * 16, int(img.size[1] * scale) * 16)  # (width, height) = (768, 512)
-    img = img.resize(target_size)
-    print(f"Resized Image size: {img.size}")
-    transform = transforms.ToTensor()
-    img_tensor = transform(img).unsqueeze(0) #[1, C, H, W]
-    print(f"Image tensor shape: {img_tensor.shape}")
-    return img_tensor
+        training_log_path = self.log_dir / "training_log.npy"
+        np.save(training_log_path, {
+            "iterations": iter_list,
+            "avg_training_psnr": psnr_list,
+            "training_time": end_time,
+            "final_avg_psnr": final_psnr,
+            "final_avg_ms_ssim": final_ms_ssim,
+            "avg_rendering_time_per_frame": test_end_time,
+            "avg_rendering_fps": 1/test_end_time
+        })
+        print(f"Training log saved to {training_log_path}")
+
+        # Return final average metrics from the last evaluation
+        return final_psnr, final_ms_ssim, end_time, test_end_time, 1/test_end_time
+
+    # --- Refactored Evaluation and Saving Logic ---
+    def evaluate_and_save_output(self, iteration):
+        """Renders frames, calculates metrics, and saves PNGs/video for a specific iteration."""
+        print(f"\n--- Evaluating and Saving Output for Iteration {iteration} ---")
+        self.gaussian_model.eval() # Set model to evaluation mode
+
+        total_psnr = 0
+        total_ms_ssim = 0
+        saved_frame_paths = []
+
+        with torch.no_grad():
+            # Render all frames at once
+            out_frames_pkg = self.gaussian_model() # Get dict with "render": (T, C, H, W)
+            out_frames = out_frames_pkg["render"].float()
+
+            # Prepare saving locations (if saving)
+            if self.save_frames:
+                # Create iteration-specific directory for frames
+                frame_save_dir = self.log_dir / f"rendered_frames_iter_{iteration}"
+                frame_save_dir.mkdir(parents=True, exist_ok=True)
+                # Video path for this iteration
+                video_save_path = self.log_dir / f"{self.video_name}_rendered_iter_{iteration}.mp4"
+
+                # Initialize Video Writer
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Codec for .mp4
+                video_writer = cv2.VideoWriter(str(video_save_path), fourcc, self.output_fps, (self.W, self.H))
+
+                print(f"Saving rendered frames to {frame_save_dir}")
+                print(f"Saving rendered video to {video_save_path} (FPS: {self.output_fps})")
+                transform_to_pil = transforms.ToPILImage()
+            else:
+                video_writer = None # No video writer needed if not saving
+
+            # Process each frame
+            for t in range(self.T):
+                gt_frame_t = self.gt_frames[t:t+1].float()
+                out_frame_t = out_frames[t:t+1] # Shape (1, C, H, W)
+
+                # Calculate metrics
+                mse_loss_t = F.mse_loss(out_frame_t, gt_frame_t)
+                psnr_t = 10 * math.log10(1.0 / max(mse_loss_t.item(), 1e-10)) # Avoid log(0)
+                ms_ssim_t = ms_ssim(out_frame_t, gt_frame_t, data_range=1, size_average=True).item()
+
+                total_psnr += psnr_t
+                total_ms_ssim += ms_ssim_t
+
+                # Save individual frames and write to video if requested
+                if self.save_frames and video_writer is not None:
+                    # Prepare frame for saving (common logic)
+                    frame_to_save = out_frame_t.squeeze(0).cpu().permute(1, 2, 0)
+                    frame_np_rgb = (frame_to_save * 255).byte().numpy()
+
+                    # --- Save PNG Frame ---
+                    img_pil = transform_to_pil(frame_np_rgb)
+                    frame_filename = f"frame_{t:04d}_psnr{psnr_t:.2f}.png"
+                    full_frame_path = frame_save_dir / frame_filename
+                    img_pil.save(full_frame_path)
+                    saved_frame_paths.append(str(full_frame_path))
+
+                    # --- Save Video Frame ---
+                    frame_np_bgr = cv2.cvtColor(frame_np_rgb, cv2.COLOR_RGB2BGR)
+                    video_writer.write(frame_np_bgr)
+
+            # Finalize video if saving
+            if self.save_frames and video_writer is not None:
+                video_writer.release()
+                print(f"Finished saving output for iteration {iteration}.")
+
+        avg_psnr = total_psnr / self.T
+        avg_ms_ssim = total_ms_ssim / self.T
+
+        # Log metrics for this evaluation
+        self.logwriter.write(f"Iteration {iteration} Eval: Avg PSNR: {avg_psnr:.4f}, Avg MS_SSIM: {avg_ms_ssim:.6f}")
+
+        self.gaussian_model.train() # Set model back to training mode
+        return avg_psnr, avg_ms_ssim
+
+    # --- Original Test Method (Now Simplified) ---
+    def test(self):
+        """Calculates and logs final metrics without saving frames/video."""
+        self.gaussian_model.eval()
+        total_psnr = 0
+        total_ms_ssim = 0
+
+        with torch.no_grad():
+            # Render all frames at once
+            out_frames_pkg = self.gaussian_model() # Get dict with "render": (T, C, H, W)
+            out_frames = out_frames_pkg["render"].float()
+
+            for t in range(self.T):
+                gt_frame_t = self.gt_frames[t:t+1].float()
+                out_frame_t = out_frames[t:t+1]
+
+                mse_loss_t = F.mse_loss(out_frame_t, gt_frame_t)
+                psnr_t = 10 * math.log10(1.0 / mse_loss_t.item())
+                ms_ssim_t = ms_ssim(out_frame_t, gt_frame_t, data_range=1, size_average=True).item()
+
+                total_psnr += psnr_t
+                total_ms_ssim += ms_ssim_t
+
+        avg_psnr = total_psnr / self.T
+        avg_ms_ssim = total_ms_ssim / self.T
+
+        self.logwriter.write(f"Test Avg PSNR: {avg_psnr:.4f}, Avg MS_SSIM: {avg_ms_ssim:.6f}")
+
+        return avg_psnr, avg_ms_ssim
+
+# Remove old image processing function (moved to utils)
+# def image_path_to_tensor(image_path: Path):
+#     ...
 
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description="Example training script.")
-    parser.add_argument(
-        "--dataset", type=str, default='./datasets/kodak/', help="Training dataset"
-    )
-    parser.add_argument(
-        "--data_name", type=str, default='kodak', help="Training dataset"
-    )
-    parser.add_argument(
-        "--iterations", type=int, default=50000, help="number of training epochs (default: %(default)s)"
-    )
-    parser.add_argument(
-        "--sh_degree", type=int, default=3, help="SH degree (default: %(default)s)"
-    )
-    parser.add_argument(
-        "--num_points",
-        type=int,
-        default=50000,
-        help="2D GS points (default: %(default)s)",
-    )
-    parser.add_argument("--model_path", type=str, default=None, help="Path to a checkpoint")
-    parser.add_argument("--seed", type=float, default=1, help="Set random seed for reproducibility")
-    parser.add_argument("--save_imgs", default=True, action="store_true", help="Save image")
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=1e-3,
-        help="Learning rate (default: %(default)s)",
-    )
+    parser = argparse.ArgumentParser(description="Train dynamic 2D Gaussians on a video.")
+    # Video input arguments
+    parser.add_argument("--video_path", type=str, required=True, help="Path to the input video file")
+    parser.add_argument("--num_frames", type=int, default=None, help="Number of frames to process from the video (default: all)")
+    # Training parameters
+    parser.add_argument("--iterations", type=int, default=30000, help="Number of training iterations (default: %(default)s)")
+    parser.add_argument("--num_points", type=int, default=5000, help="Number of 2D Gaussian points (default: %(default)s)")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: %(default)s)")
+    parser.add_argument("--opt_type", type=str, default="adan", choices=["adan", "adam"], help="Optimizer type (default: %(default)s)")
+    # Other options
+    parser.add_argument("--model_path", type=str, default=None, help="Path to a checkpoint to load (optional)")
+    parser.add_argument("--seed", type=int, default=42, help="Set random seed for reproducibility (default: %(default)s)")
+    parser.add_argument("--no_save_frames", action="store_false", dest="save_frames", help="Do not save rendered frames/video (default is to save)")
+    parser.add_argument("--output_fps", type=int, default=25, help="FPS for the output video if saving is enabled (default: %(default)s)")
+    # parser.add_argument("--sh_degree", type=int, default=0, help="SH degree (Not used in this 2D version, default: %(default)s)") # SH degree is irrelevant for 2D
+
+    # Remove old/unused arguments
+    # parser.add_argument("--dataset", type=str, default='./datasets/kodak/', help="Training dataset")
+    # parser.add_argument("--data_name", type=str, default='kodak', help="Training dataset")
+
     args = parser.parse_args(argv)
     return args
 
@@ -157,57 +284,50 @@ def main(argv):
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
 
+    # Set seed
     if args.seed is not None:
+        print(f"Setting random seed to {args.seed}")
         torch.manual_seed(args.seed)
         random.seed(args.seed)
         torch.cuda.manual_seed(args.seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
         np.random.seed(args.seed)
+        # Potentially add deterministic flags, but they can slow down training
+        # torch.backends.cudnn.deterministic = True
+        # torch.backends.cudnn.benchmark = False
 
-    logwriter = LogWriter(Path(f"./checkpoints/{args.data_name}/iter{args.iterations}_pts{args.num_points}"))
-    psnrs, ms_ssims, training_times, eval_times, eval_fpses = [], [], [], [], []
-    image_h, image_w = 0, 0
-    # if args.data_name == "kodak":
-    #     image_length, start = 24, 0
-    # elif args.data_name == "DIV2K_valid_LRX2":
-    #     image_length, start = 100, 800
-    # for i in range(start, start+image_length):
-    #     if args.data_name == "kodak":
-    #         image_path = Path(args.dataset) / f'kodim{i+1:02}.png'
-    #     elif args.data_name == "DIV2K_valid_LRX2":
-    #         image_path = Path(args.dataset) /  f'{i+1:04}x2.png'
+    # Load video frames using the utility function
+    video_path = Path(args.video_path)
+    if not video_path.is_file():
+        print(f"Error: Video file not found at {video_path}")
+        sys.exit(1)
 
-    image_paths = sorted(Path(args.dataset).glob("*.png"))
-    image_length = len(image_paths)
-    print(f"image_length: {image_length}")
+    try:
+        gt_frames_tensor = video_path_to_tensor(video_path, num_frames=args.num_frames)
+    except Exception as e:
+        print(f"Error loading video: {e}")
+        sys.exit(1)
 
-    for image_path in image_paths:
+    # --- Run Training for the single video --- #
+    # Instantiate the trainer
+    trainer = VideoTrainer(
+        gt_frames=gt_frames_tensor,
+        video_path=video_path,
+        num_points=args.num_points,
+        iterations=args.iterations,
+        args=args,
+        model_path=args.model_path
+    )
 
-        trainer = SimpleTrainer2d(image_path=image_path, num_points=args.num_points,
-            iterations=args.iterations, args=args, model_path=args.model_path)
-        psnr, ms_ssim, training_time, eval_time, eval_fps = trainer.train()
-        psnrs.append(psnr)
-        ms_ssims.append(ms_ssim)
-        training_times.append(training_time)
-        eval_times.append(eval_time)
-        eval_fpses.append(eval_fps)
-        image_h += trainer.H
-        image_w += trainer.W
-        image_name = image_path.stem
-        logwriter.write("{}: {}x{}, PSNR:{:.4f}, MS-SSIM:{:.4f}, Training:{:.4f}s, Eval:{:.8f}s, FPS:{:.4f}".format(
-            image_name, trainer.H, trainer.W, psnr, ms_ssim, training_time, eval_time, eval_fps))
+    # Save args to log dir
+    args_save_path = trainer.log_dir / "args.yaml"
+    with open(args_save_path, 'w') as f:
+        f.write(args_text)
+    print(f"Arguments saved to {args_save_path}")
 
-    avg_psnr = torch.tensor(psnrs).mean().item()
-    avg_ms_ssim = torch.tensor(ms_ssims).mean().item()
-    avg_training_time = torch.tensor(training_times).mean().item()
-    avg_eval_time = torch.tensor(eval_times).mean().item()
-    avg_eval_fps = torch.tensor(eval_fpses).mean().item()
-    avg_h = image_h//image_length
-    avg_w = image_w//image_length
+    # Start training
+    trainer.train()
 
-    logwriter.write("Average: {}x{}, PSNR:{:.4f}, MS-SSIM:{:.4f}, Training:{:.4f}s, Eval:{:.8f}s, FPS:{:.4f}".format(
-        avg_h, avg_w, avg_psnr, avg_ms_ssim, avg_training_time, avg_eval_time, avg_eval_fps))
+    print("\nTraining finished.")
 
 if __name__ == "__main__":
     main(sys.argv[1:])

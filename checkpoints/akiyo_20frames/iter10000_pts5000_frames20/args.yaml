@@ -1,0 +1,9 @@
+iterations: 10000
+lr: 0.001
+model_path: null
+num_frames: 20
+num_points: 5000
+opt_type: adan
+save_frames: false
+seed: 42
+video_path: ./dataset/akiyo_20frames.mp4
