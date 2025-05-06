@@ -34,7 +34,7 @@ class GaussianImage_Cholesky(nn.Module):
 
         # Static parameters: shape (N, ...)
         self._opacity = nn.Parameter(torch.ones((self.num_points, 1), device=self.device))
-        self._features_dc = nn.Parameter(torch.rand(self.num_points, 3, device=self.device))
+        self._features_dc = nn.Parameter(torch.randn(self.num_points, 3, device=self.device))
 
         self.last_size = (self.H, self.W)
         self.register_buffer('background', torch.zeros(3, device=self.device))
@@ -170,12 +170,65 @@ class GaussianImage_Cholesky(nn.Module):
             average_loss += temporal_cholesky_loss
 
         # Backpropagate the average loss
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         average_loss.backward()
         self.optimizer.step()
         self.scheduler.step()
 
         return average_loss, average_psnr
+
+    def prune_gaussians(self, opacity_threshold):
+        """Prunes Gaussians whose opacity is below the given threshold.
+
+        Returns:
+            int: Number of Gaussians pruned.
+        """
+        if self.num_points == 0:
+            print("No Gaussians to prune.")
+            return 0
+
+        with torch.no_grad():
+            current_opacities = self.get_opacity # Access property, shape (N, 1)
+            # Ensure it's 1D for boolean indexing across the N dimension
+            keep_mask = (current_opacities > opacity_threshold).squeeze(dim=-1) # Squeeze the last dim to make it (N)
+
+            num_to_keep = torch.sum(keep_mask).item()
+            num_pruned = self.num_points - num_to_keep
+
+            if num_pruned == 0:
+                print(f"Pruning: No Gaussians below threshold {opacity_threshold:.6f}. All {self.num_points} remain.")
+                return 0
+
+            print(f"Pruning: Keeping {num_to_keep} of {self.num_points} Gaussians (pruning {num_pruned}). Opacity threshold: {opacity_threshold:.6f}")
+
+            # Create new tensors from the masked data
+            new_xyz_data = self._xyz.data[:, keep_mask, :].clone()
+            new_cholesky_data = self._cholesky.data[:, keep_mask, :].clone()
+            new_opacity_data = self._opacity.data[keep_mask, :].clone()
+            new_features_dc_data = self._features_dc.data[keep_mask, :].clone()
+
+            # It's important that the optimizer is re-initialized *after* these parameters are replaced.
+            # The train.py script already handles optimizer re-initialization.
+
+            # Detach old parameters from the graph and allow them to be garbage collected
+            # by removing them as attributes before reassigning.
+            del self._xyz
+            del self._cholesky
+            del self._opacity
+            del self._features_dc
+
+            # Assign new nn.Parameter objects. This correctly registers them with the module.
+            self._xyz = nn.Parameter(new_xyz_data)
+            self._cholesky = nn.Parameter(new_cholesky_data)
+            self._opacity = nn.Parameter(new_opacity_data)
+            self._features_dc = nn.Parameter(new_features_dc_data)
+
+            # Ensure requires_grad is set if it was lost (it should be inherited by default by nn.Parameter)
+            # For safety, could do: self._xyz.requires_grad_(True), etc. if issues arise, but usually not needed.
+
+            self.num_points = num_to_keep
+
+        return num_pruned
 
     # def forward_quantize(self):
     #     l_vqm, m_bit = 0, 16*self.init_num_points*2

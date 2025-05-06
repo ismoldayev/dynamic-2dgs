@@ -21,6 +21,7 @@ import random
 import torchvision.transforms as transforms
 # Import the updated model
 from gaussianimage_cholesky import GaussianImage_Cholesky
+from optimizer import Adan # Make sure Adan is imported if used in re-init
 # Import cv2 for video writing
 import cv2
 
@@ -40,6 +41,7 @@ class VideoTrainer:
         print(f"Using device: {self.device}")
         self.gt_frames = gt_frames.to(self.device)
         self.T, self.C, self.H, self.W = self.gt_frames.shape
+        self.args = args # Store args
 
         self.num_points = num_points
         self.video_name = video_path.stem
@@ -106,6 +108,38 @@ class VideoTrainer:
             if iter_idx % 10 == 0:
                 progress_bar.set_postfix({f"Avg Loss":f"{loss.item():.{7}f}", "Avg PSNR":f"{psnr:.{4}f}"})
                 progress_bar.update(10)
+
+            # --- Pruning Logic ---
+            if self.args.pruning_iterations and iter_idx in self.args.pruning_iterations:
+                print(f"\n--- Attempting to Prune Gaussians at iteration {iter_idx} ---")
+                num_gaussians_before = self.gaussian_model.num_points
+
+                num_pruned = self.gaussian_model.prune_gaussians(opacity_threshold=self.args.opacity_threshold_pruning)
+
+                if num_pruned > 0:
+                    num_gaussians_after = self.gaussian_model.num_points # Should be updated by prune_gaussians
+                    print(f"Pruned {num_pruned} Gaussians. Remaining: {num_gaussians_after}.")
+                    print("Re-initializing optimizer and scheduler due to parameter change.")
+
+                    # Re-initialize optimizer (preserving current learning rate)
+                    current_lr = self.gaussian_model.optimizer.param_groups[0]['lr']
+                    if self.args.opt_type == "adam":
+                        self.gaussian_model.optimizer = torch.optim.Adam(self.gaussian_model.parameters(), lr=current_lr)
+                    else:
+                        self.gaussian_model.optimizer = Adan(self.gaussian_model.parameters(), lr=current_lr)
+
+                    # Re-initialize scheduler with the new optimizer
+                    # Assuming step_size and gamma are fixed or accessible (e.g., from args if made configurable)
+                    # For now, using the same values as in GaussianImage_Cholesky init
+                    self.gaussian_model.scheduler = torch.optim.lr_scheduler.StepLR(
+                        self.gaussian_model.optimizer,
+                        step_size=self.gaussian_model.scheduler.step_size, # Get from old scheduler
+                        gamma=self.gaussian_model.scheduler.gamma # Get from old scheduler
+                    )
+                    print(f"Optimizer and scheduler re-initialized with LR: {current_lr:.2e}")
+                else:
+                    print("No Gaussians were pruned in this step.")
+            # --- End Pruning Logic ---
 
             # --- Periodic Evaluation and Saving ---
             # Also save model checkpoint here if it's a periodic eval iteration
@@ -197,6 +231,7 @@ class VideoTrainer:
                 frame_save_dir.mkdir(parents=True, exist_ok=True)
                 # Video path for this iteration
                 video_save_path = self.log_dir / f"{self.video_name}_rendered_iter_{iteration}.mp4"
+                transform_to_pil = transforms.ToPILImage() # Define here
 
                 # Initialize Video Writer
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Codec for .mp4
@@ -204,9 +239,9 @@ class VideoTrainer:
 
                 print(f"Saving rendered frames to {frame_save_dir}")
                 print(f"Saving rendered video to {video_save_path} (FPS: {self.output_fps})")
-                transform_to_pil = transforms.ToPILImage()
             else:
                 video_writer = None # No video writer needed if not saving
+                transform_to_pil = None # Ensure it's defined if save_frames is false
 
             # Process each frame
             for t in range(self.T):
@@ -228,11 +263,15 @@ class VideoTrainer:
                     frame_np_rgb = (frame_to_save * 255).byte().numpy()
 
                     # --- Save PNG Frame ---
-                    img_pil = transform_to_pil(frame_np_rgb)
-                    frame_filename = f"frame_{t:04d}_psnr{psnr_t:.2f}.png"
-                    full_frame_path = frame_save_dir / frame_filename
-                    img_pil.save(full_frame_path)
-                    saved_frame_paths.append(str(full_frame_path))
+                    # Ensure transform_to_pil is available
+                    if transform_to_pil is not None:
+                        img_pil = transform_to_pil(frame_np_rgb)
+                        frame_filename = f"frame_{t:04d}_psnr{psnr_t:.2f}.png"
+                        full_frame_path = frame_save_dir / frame_filename
+                        img_pil.save(full_frame_path)
+                        saved_frame_paths.append(str(full_frame_path))
+                    else:
+                        print("Warning: transform_to_pil is None, cannot save PNG frame.")
 
                     # --- Save Video Frame ---
                     frame_np_bgr = cv2.cvtColor(frame_np_rgb, cv2.COLOR_RGB2BGR)
@@ -311,6 +350,9 @@ def parse_args(argv):
     parser.add_argument("--lambda_opacity_reg", type=float, default=1e-4, help="Strength of L1 opacity regularization (default: %(default)s)")
     parser.add_argument("--lambda_temporal_xyz", type=float, default=0.1, help="Strength of temporal consistency loss for XYZ (default: %(default)s)")
     parser.add_argument("--lambda_temporal_cholesky", type=float, default=0.1, help="Strength of temporal consistency loss for Cholesky (default: %(default)s)")
+    # Pruning arguments
+    parser.add_argument("--pruning_iterations", type=int, nargs='+', default=None, help="List of iterations at which to prune Gaussians (e.g., 10000 20000)")
+    parser.add_argument("--opacity_threshold_pruning", type=float, default=0.005, help="Opacity threshold below which Gaussians are pruned (default: %(default)s)")
     # parser.add_argument("--sh_degree", type=int, default=0, help="SH degree (Not used in this 2D version, default: %(default)s)") # SH degree is irrelevant for 2D
 
     # Remove old/unused arguments
