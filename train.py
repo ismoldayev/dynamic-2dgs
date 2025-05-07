@@ -48,13 +48,14 @@ class VideoTrainer:
         BLOCK_H, BLOCK_W = 16, 16 # Keep block size fixed for now
         self.iterations = iterations
         self.save_frames = args.save_frames
-        # Adjust log directory naming for video, include lambda_opacity_reg
-        opacity_reg_str = f"_opReg{args.lambda_opacity_reg:.0e}".replace("e-0", "e-") # Format like 1e-4
+        # Adjust log directory naming
+        opacity_reg_str = f"_opReg{args.lambda_opacity_reg:.0e}".replace("e-0", "e-")
         temporal_xyz_str = f"_tempXYZ{args.lambda_temporal_xyz:.0e}".replace("e-0", "e-")
         temporal_chol_str = f"_tempChol{args.lambda_temporal_cholesky:.0e}".replace("e-0", "e-")
+        color_reg_str = f"_colorReg{args.lambda_color_reg:.0e}".replace("e-0", "e-")
 
         # Add more params to log_dir name for better tracking
-        self.log_dir = Path(f"./checkpoints/{self.video_name}/iter{args.iterations}_pts{num_points}_frames{self.T}{opacity_reg_str}{temporal_xyz_str}{temporal_chol_str}_lr{args.lr:.0e}")
+        self.log_dir = Path(f"./checkpoints/{self.video_name}/iter{args.iterations}_pts{num_points}_frames{self.T}{opacity_reg_str}{temporal_xyz_str}{temporal_chol_str}{color_reg_str}_lr{args.lr:.0e}")
         self.log_dir.mkdir(parents=True, exist_ok=True)
         print(f"Logging to: {self.log_dir}")
 
@@ -70,7 +71,8 @@ class VideoTrainer:
             opt_type=args.opt_type,
             lambda_opacity_reg=args.lambda_opacity_reg,
             lambda_temporal_xyz=args.lambda_temporal_xyz,
-            lambda_temporal_cholesky=args.lambda_temporal_cholesky
+            lambda_temporal_cholesky=args.lambda_temporal_cholesky,
+            lambda_color_reg=args.lambda_color_reg
         ).to(self.device)
 
         self.logwriter = LogWriter(self.log_dir)
@@ -91,6 +93,33 @@ class VideoTrainer:
                 print(f"Could not load model checkpoint: {e}")
                 print("Starting training from scratch.")
 
+    def reinitialize_optimizer_scheduler(self):
+        """Re-initializes the optimizer and scheduler for the Gaussian model.
+        This is typically called after parameters have been added or removed (pruning/densification).
+        """
+        print("Re-initializing optimizer and scheduler due to parameter change.")
+        current_lr = self.gaussian_model.optimizer.param_groups[0]['lr'] # Preserve current LR
+
+        # Re-initialize optimizer
+        if self.args.opt_type == "adam":
+            self.gaussian_model.optimizer = torch.optim.Adam(self.gaussian_model.parameters(), lr=current_lr)
+        elif self.args.opt_type == "adan": # Ensure Adan is imported in train.py
+            self.gaussian_model.optimizer = Adan(self.gaussian_model.parameters(), lr=current_lr)
+        else:
+            raise ValueError(f"Unsupported optimizer type: {self.args.opt_type}")
+
+        # Re-initialize scheduler with the new optimizer
+        # Preserve step_size and gamma from the old scheduler if possible
+        old_step_size = self.gaussian_model.scheduler.step_size if hasattr(self.gaussian_model.scheduler, 'step_size') else 20000 # Default from GaussianImage_Cholesky
+        old_gamma = self.gaussian_model.scheduler.gamma if hasattr(self.gaussian_model.scheduler, 'gamma') else 0.5 # Default
+
+        self.gaussian_model.scheduler = torch.optim.lr_scheduler.StepLR(
+            self.gaussian_model.optimizer,
+            step_size=old_step_size,
+            gamma=old_gamma
+        )
+        print(f"Optimizer and scheduler re-initialized with LR: {current_lr:.2e}, Step: {old_step_size}, Gamma: {old_gamma}")
+
     def train(self):
         # psnr_list will store average PSNR per iteration
         psnr_list, iter_list = [], []
@@ -106,40 +135,8 @@ class VideoTrainer:
             iter_list.append(iter_idx)
 
             if iter_idx % 10 == 0:
-                progress_bar.set_postfix({f"Avg Loss":f"{loss.item():.{7}f}", "Avg PSNR":f"{psnr:.{4}f}"})
+                progress_bar.set_postfix({f"Avg Loss":f"{loss:.{7}f}", "Avg PSNR":f"{psnr:.{4}f}"})
                 progress_bar.update(10)
-
-            # --- Pruning Logic ---
-            if self.args.pruning_iterations and iter_idx in self.args.pruning_iterations:
-                print(f"\n--- Attempting to Prune Gaussians at iteration {iter_idx} ---")
-                num_gaussians_before = self.gaussian_model.num_points
-
-                num_pruned = self.gaussian_model.prune_gaussians(opacity_threshold=self.args.opacity_threshold_pruning)
-
-                if num_pruned > 0:
-                    num_gaussians_after = self.gaussian_model.num_points # Should be updated by prune_gaussians
-                    print(f"Pruned {num_pruned} Gaussians. Remaining: {num_gaussians_after}.")
-                    print("Re-initializing optimizer and scheduler due to parameter change.")
-
-                    # Re-initialize optimizer (preserving current learning rate)
-                    current_lr = self.gaussian_model.optimizer.param_groups[0]['lr']
-                    if self.args.opt_type == "adam":
-                        self.gaussian_model.optimizer = torch.optim.Adam(self.gaussian_model.parameters(), lr=current_lr)
-                    else:
-                        self.gaussian_model.optimizer = Adan(self.gaussian_model.parameters(), lr=current_lr)
-
-                    # Re-initialize scheduler with the new optimizer
-                    # Assuming step_size and gamma are fixed or accessible (e.g., from args if made configurable)
-                    # For now, using the same values as in GaussianImage_Cholesky init
-                    self.gaussian_model.scheduler = torch.optim.lr_scheduler.StepLR(
-                        self.gaussian_model.optimizer,
-                        step_size=self.gaussian_model.scheduler.step_size, # Get from old scheduler
-                        gamma=self.gaussian_model.scheduler.gamma # Get from old scheduler
-                    )
-                    print(f"Optimizer and scheduler re-initialized with LR: {current_lr:.2e}")
-                else:
-                    print("No Gaussians were pruned in this step.")
-            # --- End Pruning Logic ---
 
             # --- Periodic Evaluation and Saving ---
             # Also save model checkpoint here if it's a periodic eval iteration
@@ -200,24 +197,26 @@ class VideoTrainer:
         total_ms_ssim = 0
         saved_frame_paths = []
 
-        # --- TEMPORARY OPACITY ANALYSIS ---
+        # --- TEMPORARY COLOR FEATURE ANALYSIS ---
         with torch.no_grad():
-            current_opacities = self.gaussian_model.get_opacity.detach().cpu().numpy().flatten()
-            print(f"\n--- Opacity Analysis at Iteration {iteration} ---")
-            print(f"Number of Gaussians: {len(current_opacities)}")
-            if len(current_opacities) > 0:
-                print(f"Min opacity: {np.min(current_opacities):.6f}")
-                print(f"Max opacity: {np.max(current_opacities):.6f}")
-                print(f"Mean opacity: {np.mean(current_opacities):.6f}")
-                print(f"Median opacity: {np.median(current_opacities):.6f}")
-                percentiles_to_check = [1, 5, 10, 25, 50, 75, 90, 95, 99]
-                opacity_percentiles = np.percentile(current_opacities, percentiles_to_check)
-                for p, v in zip(percentiles_to_check, opacity_percentiles):
-                    print(f"{p}th percentile: {v:.6f}")
+            raw_color_logits = self.gaussian_model._features_dc.detach().cpu().numpy()
+            final_colors = self.gaussian_model.get_features.detach().cpu().numpy()
+            print(f"\n--- Color Feature Analysis at Iteration {iteration} ---")
+            if raw_color_logits.size > 0:
+                print("Raw Color Logits (_features_dc):")
+                print(f"  Shape: {raw_color_logits.shape}")
+                print(f"  Min: {np.min(raw_color_logits):.4f}, Max: {np.max(raw_color_logits):.4f}, Mean: {np.mean(raw_color_logits):.4f}, Median: {np.median(raw_color_logits):.4f}")
+                print("Final Colors (after sigmoid):")
+                print(f"  Shape: {final_colors.shape}")
+                print(f"  Min: {np.min(final_colors):.4f}, Max: {np.max(final_colors):.4f}, Mean: {np.mean(final_colors):.4f}, Median: {np.median(final_colors):.4f}")
+
+                # Per-channel analysis for final colors might be useful too
+                for i in range(final_colors.shape[1]): # Iterate over R, G, B channels
+                    print(f"  Channel {i} (RGB) - Min: {np.min(final_colors[:, i]):.4f}, Max: {np.max(final_colors[:, i]):.4f}, Mean: {np.mean(final_colors[:, i]):.4f}")
             else:
-                print("No Gaussians to analyze (num_points might be 0 if pruned aggressively).")
-        print("--- End Opacity Analysis ---\n")
-        # --- END TEMPORARY OPACITY ANALYSIS ---
+                print("No color features to analyze (num_points might be 0).")
+        print("--- End Color Feature Analysis ---\n")
+        # --- END TEMPORARY COLOR FEATURE ANALYSIS ---
 
         with torch.no_grad():
             # Render all frames at once
@@ -345,19 +344,27 @@ def parse_args(argv):
     # Other options
     parser.add_argument("--model_path", type=str, default=None, help="Path to a checkpoint to load (optional)")
     parser.add_argument("--seed", type=int, default=42, help="Set random seed for reproducibility (default: %(default)s)")
-    parser.add_argument("--no_save_frames", action="store_false", dest="save_frames", help="Do not save rendered frames/video (default is to save)")
+    parser.add_argument("--save_frames", action=argparse.BooleanOptionalAction, default=True, help="Save rendered frames during evaluation (default: %(default)s)")
     parser.add_argument("--output_fps", type=int, default=25, help="FPS for the output video if saving is enabled (default: %(default)s)")
     parser.add_argument("--lambda_opacity_reg", type=float, default=1e-4, help="Strength of L1 opacity regularization (default: %(default)s)")
     parser.add_argument("--lambda_temporal_xyz", type=float, default=0.1, help="Strength of temporal consistency loss for XYZ (default: %(default)s)")
     parser.add_argument("--lambda_temporal_cholesky", type=float, default=0.1, help="Strength of temporal consistency loss for Cholesky (default: %(default)s)")
-    # Pruning arguments
-    parser.add_argument("--pruning_iterations", type=int, nargs='+', default=None, help="List of iterations at which to prune Gaussians (e.g., 10000 20000)")
-    parser.add_argument("--opacity_threshold_pruning", type=float, default=0.005, help="Opacity threshold below which Gaussians are pruned (default: %(default)s)")
-    # parser.add_argument("--sh_degree", type=int, default=0, help="SH degree (Not used in this 2D version, default: %(default)s)") # SH degree is irrelevant for 2D
+    parser.add_argument("--lambda_color_reg", type=float, default=0.0, help="Strength of L2 regularization on color features (default: %(default)s - currently disabled)")
+    # Densification arguments
+    parser.add_argument("--densify_from_iter", type=int, default=500, help="Iteration to start densification (default: %(default)s)")
+    parser.add_argument("--densify_until_iter", type=int, default=15000, help="Iteration to stop densification (default: %(default)s)")
+    parser.add_argument("--densification_interval", type=int, default=100, help="Interval for densification (every N iterations) (default: %(default)s)")
+    parser.add_argument("--size_threshold_split", type=float, default=0.01, help="Average scale threshold to split a Gaussian (default: %(default)s, placeholder value)")
+    parser.add_argument("--opacity_threshold_clone", type=float, default=0.9, help="Opacity threshold to clone a small Gaussian (default: %(default)s, placeholder value)")
+    parser.add_argument("--scale_factor_split_children", type=float, default=0.6, help="Scale factor for Cholesky of children when splitting (default: %(default)s)")
+    parser.add_argument("--max_gaussians", type=int, default=60000, help="Maximum number of Gaussians after densification (default: %(default)s)")
+    parser.add_argument("--lr_final", type=float, default=1e-05, help="Final learning rate for cosine decay (default: %(default)s)")
+    parser.add_argument("--lr_delay_mult", type=float, default=0.1, help="Learning rate delay multiplier (default: %(default)s)") # From 3DGS
+    parser.add_argument("--lr_delay_steps", type=int, default=0, help="Learning rate delay steps (default: %(default)s)") # From 3DGS
+    parser.add_argument("--output_video_fps", type=float, default=25.0, help="FPS for the output rendered video (default: %(default)s)")
 
     # Remove old/unused arguments
-    # parser.add_argument("--dataset", type=str, default='./datasets/kodak/', help="Training dataset")
-    # parser.add_argument("--data_name", type=str, default='kodak', help="Training dataset")
+    # parser.add_argument("--images", type=str, default="images", help="Path to training images folder (default: %(default)s)")
 
     args = parser.parse_args(argv)
     return args
