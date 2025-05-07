@@ -52,10 +52,13 @@ class VideoTrainer:
         opacity_reg_str = f"_opReg{args.lambda_opacity_reg:.0e}".replace("e-0", "e-")
         temporal_xyz_str = f"_tempXYZ{args.lambda_temporal_xyz:.0e}".replace("e-0", "e-")
         temporal_chol_str = f"_tempChol{args.lambda_temporal_cholesky:.0e}".replace("e-0", "e-")
-        color_reg_str = f"_colorReg{args.lambda_color_reg:.0e}".replace("e-0", "e-")
+        accel_xyz_str = f"_accelXYZ{args.lambda_accel_xyz:.0e}".replace("e-0", "e-") if args.lambda_accel_xyz > 0 else ""
+        accel_chol_str = f"_accelChol{args.lambda_accel_cholesky:.0e}".replace("e-0", "e-") if args.lambda_accel_cholesky > 0 else ""
+        rigidity_str = f"_rigidN{args.k_neighbors}L{args.lambda_neighbor_rigidity:.0e}".replace("e-0", "e-") if args.lambda_neighbor_rigidity > 0 else ""
+        # color_reg_str = f"_colorReg{args.lambda_color_reg:.0e}".replace("e-0", "e-") # Removed
 
         # Add more params to log_dir name for better tracking
-        self.log_dir = Path(f"./checkpoints/{self.video_name}/iter{args.iterations}_pts{num_points}_frames{self.T}{opacity_reg_str}{temporal_xyz_str}{temporal_chol_str}{color_reg_str}_lr{args.lr:.0e}")
+        self.log_dir = Path(f"./checkpoints/{self.video_name}/iter{args.iterations}_pts{num_points}_frames{self.T}{opacity_reg_str}{temporal_xyz_str}{temporal_chol_str}{accel_xyz_str}{accel_chol_str}{rigidity_str}_lr{args.lr:.0e}")
         self.log_dir.mkdir(parents=True, exist_ok=True)
         print(f"Logging to: {self.log_dir}")
 
@@ -72,7 +75,11 @@ class VideoTrainer:
             lambda_opacity_reg=args.lambda_opacity_reg,
             lambda_temporal_xyz=args.lambda_temporal_xyz,
             lambda_temporal_cholesky=args.lambda_temporal_cholesky,
-            lambda_color_reg=args.lambda_color_reg
+            lambda_accel_xyz=args.lambda_accel_xyz,
+            lambda_accel_cholesky=args.lambda_accel_cholesky,
+            lambda_neighbor_rigidity=args.lambda_neighbor_rigidity,
+            k_neighbors=args.k_neighbors,
+            # lambda_color_reg=args.lambda_color_reg # Removed
         ).to(self.device)
 
         self.logwriter = LogWriter(self.log_dir)
@@ -347,9 +354,12 @@ def parse_args(argv):
     parser.add_argument("--save_frames", action=argparse.BooleanOptionalAction, default=True, help="Save rendered frames during evaluation (default: %(default)s)")
     parser.add_argument("--output_fps", type=int, default=25, help="FPS for the output video if saving is enabled (default: %(default)s)")
     parser.add_argument("--lambda_opacity_reg", type=float, default=1e-4, help="Strength of L1 opacity regularization (default: %(default)s)")
-    parser.add_argument("--lambda_temporal_xyz", type=float, default=0.1, help="Strength of temporal consistency loss for XYZ (default: %(default)s)")
-    parser.add_argument("--lambda_temporal_cholesky", type=float, default=0.1, help="Strength of temporal consistency loss for Cholesky (default: %(default)s)")
-    parser.add_argument("--lambda_color_reg", type=float, default=0.0, help="Strength of L2 regularization on color features (default: %(default)s - currently disabled)")
+    parser.add_argument("--lambda_temporal_xyz", type=float, default=0.1, help="Strength of temporal consistency loss for XYZ (velocity penalty) (default: %(default)s)")
+    parser.add_argument("--lambda_temporal_cholesky", type=float, default=0.1, help="Strength of temporal consistency loss for Cholesky (velocity penalty) (default: %(default)s)")
+    parser.add_argument("--lambda_accel_xyz", type=float, default=0.0, help="Strength of temporal acceleration loss for XYZ (default: %(default)s)")
+    parser.add_argument("--lambda_accel_cholesky", type=float, default=0.0, help="Strength of temporal acceleration loss for Cholesky (default: %(default)s)")
+    parser.add_argument("--lambda_neighbor_rigidity", type=float, default=0.0, help="Strength of neighbor rigidity loss (maintaining inter-Gaussian distances) (default: %(default)s)")
+    parser.add_argument("--k_neighbors", type=int, default=5, help="Number of neighbors for rigidity loss (default: %(default)s)")
     # Densification arguments
     parser.add_argument("--densify_from_iter", type=int, default=500, help="Iteration to start densification (default: %(default)s)")
     parser.add_argument("--densify_until_iter", type=int, default=15000, help="Iteration to stop densification (default: %(default)s)")
@@ -362,6 +372,7 @@ def parse_args(argv):
     parser.add_argument("--lr_delay_mult", type=float, default=0.1, help="Learning rate delay multiplier (default: %(default)s)") # From 3DGS
     parser.add_argument("--lr_delay_steps", type=int, default=0, help="Learning rate delay steps (default: %(default)s)") # From 3DGS
     parser.add_argument("--output_video_fps", type=float, default=25.0, help="FPS for the output rendered video (default: %(default)s)")
+    parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay rate for temporal regularization")
 
     # Remove old/unused arguments
     # parser.add_argument("--images", type=str, default="images", help="Path to training images folder (default: %(default)s)")

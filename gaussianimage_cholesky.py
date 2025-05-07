@@ -61,7 +61,7 @@ class EMA:
         return self.shadow_params
 
 class GaussianImage_Cholesky(nn.Module):
-    def __init__(self, loss_type="L2", T=1, lambda_opacity_reg=0.0, lambda_temporal_xyz=0.0, lambda_temporal_cholesky=0.0, lambda_color_reg=0.0, ema_decay=0.999, **kwargs):
+    def __init__(self, loss_type="L2", T=1, lambda_opacity_reg=0.0, lambda_temporal_xyz=0.0, lambda_temporal_cholesky=0.0, lambda_accel_xyz=0.0, lambda_accel_cholesky=0.0, lambda_neighbor_rigidity=0.0, k_neighbors=5, ema_decay=0.999, **kwargs):
         super().__init__()
         self.loss_type = loss_type
         self.num_points = kwargs["num_points"]
@@ -70,7 +70,10 @@ class GaussianImage_Cholesky(nn.Module):
         self.lambda_opacity_reg = lambda_opacity_reg
         self.lambda_temporal_xyz = lambda_temporal_xyz
         self.lambda_temporal_cholesky = lambda_temporal_cholesky
-        self.lambda_color_reg = lambda_color_reg
+        self.lambda_accel_xyz = lambda_accel_xyz
+        self.lambda_accel_cholesky = lambda_accel_cholesky
+        self.lambda_neighbor_rigidity = lambda_neighbor_rigidity
+        self.k_neighbors = k_neighbors
         self.BLOCK_W, self.BLOCK_H = kwargs["BLOCK_W"], kwargs["BLOCK_H"]
         self.tile_bounds = (
             (self.W + self.BLOCK_W - 1) // self.BLOCK_W,
@@ -80,17 +83,22 @@ class GaussianImage_Cholesky(nn.Module):
         self.device = kwargs["device"]
 
         # Time-varying parameters: shape (T, N, ...)
+        # Initialize _xyz to be random for each Gaussian across all frames
         self._xyz = nn.Parameter(torch.atanh(2 * (torch.rand(self.T, self.num_points, 2, device=self.device) - 0.5)))
+
         # Initialize cholesky near identity (small off-diag, positive diag)
-        init_chol = torch.tensor([1.0, 0.0, 1.0], device=self.device).view(1, 1, 3)
-        self._cholesky = nn.Parameter(init_chol.repeat(self.T, self.num_points, 1) + torch.randn(self.T, self.num_points, 3, device=self.device) * 0.01)
+        # Initialize _cholesky to be the same for each Gaussian across all frames (current setup)
+        init_chol_base = torch.tensor([1.0, 0.0, 1.0], device=self.device).view(1, 3) # Shape (1, 3)
+        noise_per_gaussian = torch.randn(self.num_points, 3, device=self.device) * 0.01 # Shape (N, 3)
+        initial_cholesky_per_gaussian = init_chol_base.repeat(self.num_points, 1) + noise_per_gaussian # Shape (N, 3)
+        self._cholesky = nn.Parameter(initial_cholesky_per_gaussian.unsqueeze(0).repeat(self.T, 1, 1))
 
         # Static parameters: shape (N, ...)
         self._opacity = nn.Parameter(torch.ones((self.num_points, 1), device=self.device))
         self._features_dc = nn.Parameter(torch.randn(self.num_points, 3, device=self.device))
 
         self.last_size = (self.H, self.W)
-        self.register_buffer('background', torch.zeros(3, device=self.device))
+        # self.register_buffer('background', torch.rand(3, device=self.device)) # Removed: background will be handled in forward
         self.opacity_activation = torch.sigmoid
         self.rgb_activation = torch.sigmoid
         # self.register_buffer('bound', torch.tensor([0.5, 0.5]).view(1, 2).to(self.device)) # Not used?
@@ -113,6 +121,28 @@ class GaussianImage_Cholesky(nn.Module):
         else:
             self.optimizer = Adan(self.parameters(), lr=kwargs["lr"])
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=20000, gamma=0.5)
+
+        # Initialize neighbor information for rigidity loss
+        if self.lambda_neighbor_rigidity > 0 and self.num_points > self.k_neighbors and self.T > 1 and self.k_neighbors > 0:
+            with torch.no_grad(): # Operations here should not be part of the computation graph for _xyz init
+                # Detach explicitly if get_xyz involves operations on parameters being optimized
+                xyz_t0 = self.get_xyz[0].clone().detach() # Shape (N, 2)
+
+                # Pairwise squared Euclidean distances
+                # cdist computes L2 norm (Euclidean distance), then we square it for consistency with some formulations
+                # However, working with direct distances (sqrt) is fine and perhaps more intuitive.
+                pairwise_distances = torch.cdist(xyz_t0, xyz_t0, p=2.0) # Shape (N, N)
+                pairwise_distances.fill_diagonal_(float('inf')) # Ignore distance to self
+
+                initial_neighbor_distances, neighbor_indices = torch.topk(
+                    pairwise_distances, self.k_neighbors, dim=1, largest=False
+                )
+                self.register_buffer('initial_neighbor_distances', initial_neighbor_distances, persistent=False)
+                self.register_buffer('neighbor_indices', neighbor_indices, persistent=False)
+                # print(f"Initialized neighbor rigidity buffers. Shapes: D={self.initial_neighbor_distances.shape}, I={self.neighbor_indices.shape}")
+        else:
+            if self.lambda_neighbor_rigidity > 0:
+                print("Warning: Neighbor rigidity loss not initialized due to insufficient points, T<=1, or k_neighbors<=0.")
 
     # def _init_data(self):
     #     self.cholesky_quantizer._init_data(self._cholesky)
@@ -141,18 +171,26 @@ class GaussianImage_Cholesky(nn.Module):
         # Ensure cholesky_bound broadcasts correctly: (1, 1, 3)
         return self._cholesky + self.cholesky_bound
 
-    def forward(self, frame_index=None):
+    def forward(self, frame_index=None, background_color_override=None):
         """Render either a specific frame or all frames.
 
         Args:
             frame_index (int, optional): If specified, render only this frame.
                                        Otherwise, render all frames.
+            background_color_override (torch.Tensor, optional): If provided, use this as the background color.
+                                                              Otherwise, defaults to white.
 
         Returns:
             dict: Dictionary containing the rendered image(s).
                   If frame_index is given, "render" has shape (1, C, H, W).
                   Otherwise, "render" has shape (T, C, H, W).
         """
+
+        if background_color_override is not None:
+            active_background = background_color_override
+        else:
+            active_background = torch.ones(3, device=self.device) # Default to white (was torch.zeros for black)
+
         if frame_index is not None:
             # Render a single frame t
             means_t = self.get_xyz[frame_index] # (N, 2)
@@ -168,7 +206,7 @@ class GaussianImage_Cholesky(nn.Module):
             out_img = rasterize_gaussians_sum(
                 xys, depths, radii, conics, num_tiles_hit,
                 colors, opacities, self.H, self.W, self.BLOCK_H, self.BLOCK_W,
-                background=self.background, return_alpha=False
+                background=active_background, return_alpha=False
             )
             out_img = torch.clamp(out_img, 0, 1) #[H, W, 3]
             # Reshape to (1, C, H, W)
@@ -178,7 +216,8 @@ class GaussianImage_Cholesky(nn.Module):
             # Render all frames (can be memory intensive)
             all_frames_rendered = []
             for t in range(self.T):
-                frame_render_pkg = self.forward(frame_index=t)
+                # Pass the background_color_override to recursive calls
+                frame_render_pkg = self.forward(frame_index=t, background_color_override=active_background)
                 all_frames_rendered.append(frame_render_pkg["render"])
             # Stack along the time dimension
             all_frames_tensor = torch.cat(all_frames_rendered, dim=0) # (T, C, H, W)
@@ -196,8 +235,11 @@ class GaussianImage_Cholesky(nn.Module):
         total_loss = 0
         total_psnr = 0
 
-        # Render all frames
-        rendered_frames_pkg = self.forward() # Gets dict with "render": (T, C, H, W)
+        # Generate a random background color for this iteration
+        # iter_random_background = torch.rand(3, device=self.device) # Removed for always-white background
+
+        # Render all frames using the default background (now white)
+        rendered_frames_pkg = self.forward() # Removed background_color_override
         rendered_frames = rendered_frames_pkg["render"]
 
         # Calculate loss and PSNR per frame and average
@@ -234,10 +276,57 @@ class GaussianImage_Cholesky(nn.Module):
             temporal_cholesky_loss = self.lambda_temporal_cholesky * torch.mean(cholesky_diff**2)
             average_loss += temporal_cholesky_loss
 
-        # Add L2 regularization on color features (_features_dc)
-        if self.lambda_color_reg > 0:
-            color_reg_loss = self.lambda_color_reg * torch.mean(self._features_dc**2)
-            average_loss += color_reg_loss
+        # Add temporal acceleration regularization for XYZ
+        if self.lambda_accel_xyz > 0 and self.T > 2:
+            xyz_params = self.get_xyz # Shape (T, N, 2)
+            # P[t] - 2*P[t-1] + P[t-2]
+            xyz_accel = xyz_params[2:] - 2 * xyz_params[1:-1] + xyz_params[:-2]
+            temporal_accel_xyz_loss = self.lambda_accel_xyz * torch.mean(xyz_accel**2)
+            average_loss += temporal_accel_xyz_loss
+
+        # Add temporal acceleration regularization for Cholesky components
+        if self.lambda_accel_cholesky > 0 and self.T > 2:
+            cholesky_params = self.get_cholesky_elements # Shape (T, N, 3)
+            # P[t] - 2*P[t-1] + P[t-2]
+            cholesky_accel = cholesky_params[2:] - 2 * cholesky_params[1:-1] + cholesky_params[:-2]
+            temporal_accel_cholesky_loss = self.lambda_accel_cholesky * torch.mean(cholesky_accel**2)
+            average_loss += temporal_accel_cholesky_loss
+
+        # Add neighbor rigidity loss
+        if self.lambda_neighbor_rigidity > 0 and self.T > 1 and hasattr(self, 'neighbor_indices') and hasattr(self, 'initial_neighbor_distances'):
+            rigidity_loss_accumulator = 0.0
+            num_valid_frames_for_rigidity = 0
+            all_xyz_current_frames = self.get_xyz # Get all current xyz states (T, N, 2)
+
+            for t in range(1, self.T): # Compare frames t > 0 to the t=0 structure
+                current_xyz_at_t = all_xyz_current_frames[t] # Shape (N, 2)
+
+                # For each point i, its position is current_xyz_at_t[i]
+                # Its neighbors' indices are self.neighbor_indices[i] (shape k)
+                # Their positions at time t are current_xyz_at_t[self.neighbor_indices[i]] (shape k, 2)
+
+                # Positions of center points for distance calculation (expanded for broadcasting)
+                # Unsqueeze to make it (N, 1, 2) to subtract from (N, k, 2)
+                center_points_pos_t = current_xyz_at_t.unsqueeze(1) # (N, 1, 2)
+
+                # Gather positions of neighbors at current time t
+                # self.neighbor_indices has shape (N, k_neighbors)
+                # current_xyz_at_t has shape (N, 2)
+                # current_xyz_at_t[self.neighbor_indices] directly gathers, resulting in (N, k_neighbors, 2)
+                neighbor_points_pos_t = current_xyz_at_t[self.neighbor_indices]
+
+                # Calculate squared Euclidean distances to neighbors at current time t
+                dist_sq_to_neighbors_t = torch.sum((center_points_pos_t - neighbor_points_pos_t)**2, dim=2) # Shape (N, k_neighbors)
+                current_distances_to_neighbors_t = torch.sqrt(dist_sq_to_neighbors_t + 1e-8) # Add epsilon for stability
+
+                # Difference from initial distances
+                distance_diff = self.initial_neighbor_distances - current_distances_to_neighbors_t
+                rigidity_loss_accumulator += torch.mean(distance_diff**2)
+                num_valid_frames_for_rigidity += 1
+
+            if num_valid_frames_for_rigidity > 0:
+                mean_rigidity_loss = rigidity_loss_accumulator / num_valid_frames_for_rigidity
+                average_loss += self.lambda_neighbor_rigidity * mean_rigidity_loss
 
         # Backpropagate the average loss
         self.optimizer.zero_grad(set_to_none=True)
@@ -254,178 +343,6 @@ class GaussianImage_Cholesky(nn.Module):
 
         # print(f"Debug: type(average_loss)={type(average_loss)}, type(average_psnr)={type(average_psnr)}")
         return average_loss.item(), average_psnr
-
-    def densify_gaussians(
-        self,
-        gt_frames: torch.Tensor, # (T, C, H, W) - for potential future use with gradients
-        size_threshold_split: float,
-        opacity_threshold_clone: float,
-        scale_factor_split_children: float,
-        max_gaussians_scene: int
-    ) -> int:
-        """Densifies Gaussians by splitting large ones or cloning small, opaque ones."""
-
-        num_gaussians_before = self.num_points
-        if num_gaussians_before == 0: # Can't densify if there are no Gaussians
-            return 0
-        if num_gaussians_before >= max_gaussians_scene:
-            print(f"Max Gaussians ({max_gaussians_scene}) reached. Skipping densification.")
-            return 0
-
-        num_added_total = 0
-
-        with torch.no_grad():
-            # Calculate current scales of Gaussians
-            # self._cholesky diagonal elements are log-scales.
-            # Consider only the first two diagonal elements for 2D scale.
-            current_raw_scales_t_n_dim = torch.exp(self._cholesky[:, :, torch.arange(2), torch.arange(2)]) # Shape (T, N, 2)
-
-            # Use the maximum of the two scale components at each time step, then average over time
-            max_scale_component_t_n = torch.max(current_raw_scales_t_n_dim[:,:,0], current_raw_scales_t_n_dim[:,:,1]) # Shape (T, N)
-            avg_max_scale_n = torch.mean(max_scale_component_t_n, dim=0) # Shape (N,)
-
-            # --- Stage 1: Identify Gaussians to split (large Gaussians) ---
-            split_candidate_mask_n = avg_max_scale_n > size_threshold_split
-
-            # Also ensure we don't try to split if it would exceed max_gaussians_scene
-            # Each split adds 1 Gaussian (parent removed, 2 children added)
-            # Available slots for new Gaussians from splitting = max_gaussians_scene - num_gaussians_before
-            # If num_to_split > available_slots, we must cap num_to_split
-
-            potential_splits_indices = torch.where(split_candidate_mask_n)[0]
-            num_potential_splits = potential_splits_indices.shape[0]
-
-            available_slots = max_gaussians_scene - num_gaussians_before
-
-            if num_potential_splits > available_slots and available_slots > 0:
-                # If we want to split more than we have slots for, prioritize splitting the largest ones
-                print(f"Capping splits: {num_potential_splits} candidates, but only {available_slots} slots available.")
-                sorted_split_candidates_by_size_indices = torch.argsort(avg_max_scale_n[potential_splits_indices], descending=True)
-                gaussians_to_split_indices = potential_splits_indices[sorted_split_candidates_by_size_indices[:available_slots]]
-            elif available_slots <= 0 :
-                 gaussians_to_split_indices = torch.empty(0, dtype=torch.long, device=self.device)
-            else:
-                gaussians_to_split_indices = potential_splits_indices
-
-            num_to_split = gaussians_to_split_indices.shape[0]
-
-            # --- Stage 2: Identify Gaussians to clone (small but high opacity Gaussians) ---
-            # These should not be candidates for splitting
-            not_splitting_mask_n = ~torch.isin(torch.arange(self.num_points, device=self.device), gaussians_to_split_indices)
-
-            current_opacities_n = self.get_opacity.squeeze(-1) # Shape (N,)
-
-            # "Small" means their average max scale is NOT above size_threshold_split
-            # (or we could use a different, smaller threshold for "smallness" if desired)
-            is_small_n = avg_max_scale_n <= size_threshold_split
-
-            clone_candidate_mask_n = not_splitting_mask_n & is_small_n & (current_opacities_n > opacity_threshold_clone)
-
-            potential_clones_indices = torch.where(clone_candidate_mask_n)[0]
-            num_potential_clones = potential_clones_indices.shape[0]
-
-            # Each clone adds 1 Gaussian.
-            # Available slots after considering splits = max_gaussians_scene - (num_gaussians_before + num_to_split)
-            available_slots_for_cloning = max_gaussians_scene - (num_gaussians_before + num_to_split)
-
-            if num_potential_clones > available_slots_for_cloning and available_slots_for_cloning > 0:
-                # If we want to clone more than we have slots for, prioritize cloning the most opaque ones
-                print(f"Capping clones: {num_potential_clones} candidates, but only {available_slots_for_cloning} slots available.")
-                sorted_clone_candidates_by_opacity_indices = torch.argsort(current_opacities_n[potential_clones_indices], descending=True)
-                gaussians_to_clone_indices = potential_clones_indices[sorted_clone_candidates_by_opacity_indices[:available_slots_for_cloning]]
-            elif available_slots_for_cloning <= 0:
-                gaussians_to_clone_indices = torch.empty(0, dtype=torch.long, device=self.device)
-            else:
-                gaussians_to_clone_indices = potential_clones_indices
-
-            num_to_clone = gaussians_to_clone_indices.shape[0]
-
-            if num_to_split == 0 and num_to_clone == 0:
-                return 0 # No changes made
-
-            # Lists to store parameters of all Gaussians that will exist after densification
-            all_final_xyz = []
-            all_final_cholesky = []
-            all_final_dc = []
-            all_final_opacity = []
-
-            current_xyz_data = self._xyz.data.clone()
-            current_cholesky_data = self._cholesky.data.clone()
-            current_features_dc_data = self._features_dc.data.clone()
-            current_opacity_data = self._opacity.data.clone()
-
-            # --- Add parameters of Gaussians that are kept (i.e., not split) ---
-            keep_mask = torch.ones(self.num_points, dtype=torch.bool, device=self.device)
-            if num_to_split > 0:
-                keep_mask[gaussians_to_split_indices] = False
-
-            if keep_mask.any(): # Only add if some are actually kept
-                all_final_xyz.append(current_xyz_data[:, keep_mask, :])
-                all_final_cholesky.append(current_cholesky_data[:, keep_mask, :, :])
-                all_final_dc.append(current_features_dc_data[keep_mask, :])
-                all_final_opacity.append(current_opacity_data[keep_mask, :])
-
-            # --- Perform Splitting and add children ---
-            if num_to_split > 0:
-                print(f"Splitting {num_to_split} large Gaussians.")
-                split_parents_xyz = current_xyz_data[:, gaussians_to_split_indices, :]         # T, num_split, 3
-                split_parents_cholesky = current_cholesky_data[:, gaussians_to_split_indices, :, :] # T, num_split, 3, 3
-                split_parents_dc = current_features_dc_data[gaussians_to_split_indices, :]       # num_split, 3
-                split_parents_opacity = current_opacity_data[gaussians_to_split_indices, :]    # num_split, 1
-
-                child1_cholesky = split_parents_cholesky.clone()
-                child1_cholesky[:, :, torch.arange(2), torch.arange(2)] += torch.log(torch.tensor(scale_factor_split_children, device=self.device))
-                child2_cholesky = split_parents_cholesky.clone()
-                child2_cholesky[:, :, torch.arange(2), torch.arange(2)] += torch.log(torch.tensor(scale_factor_split_children, device=self.device))
-
-                parent_scales_t_s_dim = torch.exp(split_parents_cholesky[:, :, torch.arange(2), torch.arange(2)]) # T, num_split, 2
-                offset_xy_t_s_dim = (torch.rand_like(parent_scales_t_s_dim) - 0.5) * 0.1 * parent_scales_t_s_dim
-                offset_t_s_3 = torch.cat([offset_xy_t_s_dim, torch.zeros_like(offset_xy_t_s_dim[..., :1])], dim=-1)
-
-                child1_xyz = split_parents_xyz - offset_t_s_3
-                child2_xyz = split_parents_xyz + offset_t_s_3
-
-                all_final_xyz.extend([child1_xyz, child2_xyz])
-                all_final_cholesky.extend([child1_cholesky, child2_cholesky])
-                all_final_dc.extend([split_parents_dc, split_parents_dc])
-                all_final_opacity.extend([split_parents_opacity, split_parents_opacity])
-
-            # --- Perform Cloning and add clones ---
-            if num_to_clone > 0:
-                print(f"Cloning {num_to_clone} small, opaque Gaussians.")
-                cloned_xyz = current_xyz_data[:, gaussians_to_clone_indices, :]
-                cloned_cholesky = current_cholesky_data[:, gaussians_to_clone_indices, :, :]
-                cloned_dc = current_features_dc_data[gaussians_to_clone_indices, :]
-                cloned_opacity = current_opacity_data[gaussians_to_clone_indices, :]
-
-                all_final_xyz.append(cloned_xyz)
-                all_final_cholesky.append(cloned_cholesky)
-                all_final_dc.append(cloned_dc)
-                all_final_opacity.append(cloned_opacity)
-
-            # Concatenate all parameters to form the new set
-            if not all_final_dc: # Should not happen if num_gaussians_before > 0 and (num_split > 0 or num_clone > 0 or keep_mask.any())
-                 print("Warning: Densification resulted in zero Gaussians. No changes applied.")
-                 # num_points remains num_gaussians_before, num_added_total will be 0 due to later calculation
-            else:
-                 self._xyz = nn.Parameter(torch.cat(all_final_xyz, dim=1))
-                 self._cholesky = nn.Parameter(torch.cat(all_final_cholesky, dim=1))
-                 self._features_dc = nn.Parameter(torch.cat(all_final_dc, dim=0))
-                 self._opacity = nn.Parameter(torch.cat(all_final_opacity, dim=0))
-                 self.num_points = self._features_dc.shape[0] # N is dim 0 for static params
-
-        num_added_total = self.num_points - num_gaussians_before
-
-        if num_added_total > 0:
-            # Re-initialize EMA buffers if they exist, for the new set of Gaussians
-            if hasattr(self, 'ema_xyz') and self.ema_xyz is not None:
-                print("Re-initializing EMA for _xyz")
-                self.ema_xyz = EMA([self._xyz], decay=self.ema_decay) # Use stored self.ema_decay
-            if hasattr(self, 'ema_cholesky') and self.ema_cholesky is not None:
-                print("Re-initializing EMA for _cholesky")
-                self.ema_cholesky = EMA([self._cholesky], decay=self.ema_decay) # Use stored self.ema_decay
-
-        return num_added_total
 
     # def forward_quantize(self):
     #     l_vqm, m_bit = 0, 16*self.init_num_points*2
