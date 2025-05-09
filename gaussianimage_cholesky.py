@@ -8,6 +8,12 @@ import math
 # from quantize import *
 from optimizer import Adan
 from typing import Optional
+import torch.nn.functional as F # For cosine similarity
+
+# Helper for logit transformation
+def _logit(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    x_clamped = torch.clamp(x, eps, 1.0 - eps)
+    return torch.log(x_clamped / (1.0 - x_clamped))
 
 class EMA:
     """Exponential Moving Average for PyTorch Models"""
@@ -62,7 +68,7 @@ class EMA:
         return self.shadow_params
 
 class GaussianImage_Cholesky(nn.Module):
-    def __init__(self, loss_type="L2", T=1, lambda_neighbor_rigidity=0.0, k_neighbors=5, ema_decay=0.999, polynomial_degree=1, lambda_xyz_coeffs_reg=0.0, lambda_cholesky_coeffs_reg=0.0, lambda_opacity_coeffs_reg=0.0, opacity_polynomial_degree=None, **kwargs):
+    def __init__(self, loss_type="L2", T=1, lambda_neighbor_rigidity=0.0, k_neighbors=5, ema_decay=0.999, polynomial_degree=1, lambda_xyz_coeffs_reg=0.0, lambda_cholesky_coeffs_reg=0.0, lambda_opacity_coeffs_reg=0.0, opacity_polynomial_degree=None, gt_frames_for_init: Optional[torch.Tensor] = None, initialization_logit_eps: float = 1e-6, **kwargs):
         super().__init__()
         self.loss_type = loss_type
         self.num_points = kwargs["num_points"]
@@ -147,6 +153,76 @@ class GaussianImage_Cholesky(nn.Module):
         # Static parameters: features_dc are still static for now
         # self._opacity = nn.Parameter(torch.ones((self.num_points, 1), device=self.device))) # Old static opacity
         self._features_dc = nn.Parameter(torch.randn(self.num_points, 3, device=self.device))
+
+        # --- New Initialization Logic for Color and Opacity ---
+        if gt_frames_for_init is not None and self.T > 0 and self.num_points > 0 and \
+           gt_frames_for_init.shape[0] == self.T and \
+           gt_frames_for_init.shape[2] == self.H and gt_frames_for_init.shape[3] == self.W:
+
+            print(f"Using ground truth frames for Gaussian color and (cosine similarity based) opacity initialization with eps {initialization_logit_eps:.1e}.")
+
+            # Detach initial_xyz_c0 from computation graph for this part as it's an input to init
+            initial_xyz_c0_detached = self._xyz_coeffs[0].clone().detach() # Shape (N, 2)
+
+            new_features_dc_list = []
+            new_opacity_c0_logits_list = []
+
+            for n in range(self.num_points):
+                # Denormalize XY to pixel coordinates
+                xy_n_normalized = torch.tanh(initial_xyz_c0_detached[n]) # Values in [-1, 1)
+                px = torch.clamp(torch.round((xy_n_normalized[0] * 0.5 + 0.5) * (self.W -1)).long(), 0, self.W - 1)
+                py = torch.clamp(torch.round((xy_n_normalized[1] * 0.5 + 0.5) * (self.H -1)).long(), 0, self.H - 1)
+
+                # Sample color from a random frame
+                rand_frame_idx = torch.randint(0, self.T, (1,), device=self.device).item()
+                # Ensure gt_frames_for_init is on the correct device, though it should be if passed from trainer
+                initial_color_n = gt_frames_for_init[rand_frame_idx, :, py, px].to(self.device) # Shape (3,), values in [0,1]
+
+                new_features_dc_list.append(_logit(initial_color_n, initialization_logit_eps))
+
+                # Calculate opacity based on average cosine similarity
+                cosine_similarities_sum = 0.0
+                num_frames_for_avg = 0
+                # Add a small epsilon for cosine similarity denominator stability
+                cosine_sim_eps = 1e-8
+
+                for t_idx in range(self.T):
+                    pixel_color_t = gt_frames_for_init[t_idx, :, py, px].to(self.device)
+
+                    # Cosine similarity: (A dot B) / (||A|| * ||B|| + eps)
+                    # Colors are in [0,1], so norms are non-negative.
+                    # F.cosine_similarity expects inputs of shape (..., D) and (..., D)
+                    # initial_color_n is (3), pixel_color_t is (3)
+                    # We need to unsqueeze them to (1,3) to make them batch-like for F.cosine_similarity
+                    cos_sim = F.cosine_similarity(initial_color_n.unsqueeze(0), pixel_color_t.unsqueeze(0), dim=1, eps=cosine_sim_eps)
+                    cosine_similarities_sum += cos_sim.item() # cos_sim is a tensor with one element
+                    num_frames_for_avg +=1
+
+                avg_cosine_similarity = cosine_similarities_sum / num_frames_for_avg if num_frames_for_avg > 0 else 0.0
+                # Ensure avg_cosine_similarity is within [0,1] as colors are non-negative.
+                # Cosine similarity for non-negative vectors will be [0,1]. Clamping defensively.
+                target_opacity_val = torch.clamp(1.0 - torch.tensor(avg_cosine_similarity, device=self.device), 0.0, 1.0)
+
+                new_opacity_c0_logits_list.append(_logit(target_opacity_val, initialization_logit_eps))
+
+            # Update parameters
+            if new_features_dc_list:
+                self._features_dc.data = torch.stack(new_features_dc_list)
+
+            if new_opacity_c0_logits_list:
+                # _opacity_coeffs has shape (num_coeffs_opacity, N, 1)
+                # We are setting the constant term (coeffs[0])
+                current_opacity_coeffs = self._opacity_coeffs.data.clone()
+                current_opacity_coeffs[0] = torch.stack(new_opacity_c0_logits_list).unsqueeze(-1) # Add channel dim
+                self._opacity_coeffs.data = current_opacity_coeffs
+
+            print("Finished custom initialization of color and opacity.")
+        else:
+            if gt_frames_for_init is not None:
+                print("Warning: Skipping custom Gaussian initialization. Conditions not met (e.g., no points, T=0, or frame shape mismatch).")
+            # If not using custom init, _features_dc keeps its randn init, and _opacity_coeffs keeps its zeros init for c0.
+
+        # --- End New Initialization Logic ---
 
         self.last_size = (self.H, self.W)
         # self.register_buffer('background', torch.rand(3, device=self.device)) # Removed: background will be handled in forward

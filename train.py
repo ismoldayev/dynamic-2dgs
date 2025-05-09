@@ -87,7 +87,10 @@ class VideoTrainer:
             lambda_cholesky_coeffs_reg=args.lambda_cholesky_coeffs_reg,
             lambda_opacity_coeffs_reg=args.lambda_opacity_coeffs_reg,
             ema_decay=args.ema_decay,
-            opacity_polynomial_degree=args.opacity_polynomial_degree
+            opacity_polynomial_degree=args.opacity_polynomial_degree,
+            # Pass GT frames and new init args
+            gt_frames_for_init=self.all_gt_frames,
+            initialization_logit_eps=args.initialization_logit_eps
         ).to(self.device)
 
         self.logwriter = LogWriter(self.log_dir)
@@ -261,7 +264,26 @@ class VideoTrainer:
                 xyz_for_viz = all_xyz_normalized_full_trajectory[eval_indices] # (num_eval_frames, N, 2)
 
                 static_colors_rgb_norm = self.gaussian_model.get_features.detach().cpu().numpy()
-                static_colors_bgr_uint8 = (static_colors_rgb_norm[:, [2, 1, 0]] * 255).astype(np.uint8)
+                static_colors_bgr_uint8_all = (static_colors_rgb_norm[:, [2, 1, 0]] * 255).astype(np.uint8) # All gaussians
+
+                # --- Select a subset of Gaussians for visualization ---
+                max_gaussians_to_visualize = 5000
+                num_total_gaussians = self.gaussian_model.num_points
+
+                if num_total_gaussians > max_gaussians_to_visualize:
+                    # Ensure random selection is consistent for the video, so do it once.
+                    # Use torch.randperm for efficient random permutation of indices on CPU
+                    perm = torch.randperm(num_total_gaussians, device='cpu')
+                    visualized_gaussian_indices = perm[:max_gaussians_to_visualize]
+                    num_gaussians_in_viz = max_gaussians_to_visualize
+                    print(f"Visualizing dynamics for a random subset of {num_gaussians_in_viz} Gaussians (out of {num_total_gaussians}).")
+                else:
+                    visualized_gaussian_indices = torch.arange(num_total_gaussians, device='cpu')
+                    num_gaussians_in_viz = num_total_gaussians
+                    print(f"Visualizing dynamics for all {num_gaussians_in_viz} Gaussians.")
+
+                static_colors_bgr_uint8_viz = static_colors_bgr_uint8_all[visualized_gaussian_indices.numpy()]
+                # --- End selection of Gaussians for visualization ---
 
                 centers_video_path = self.log_dir / f"{self.video_name}_centers_iter_{iteration}.mp4"
                 frame_h_viz, frame_w_viz = self.H, self.W
@@ -275,14 +297,15 @@ class VideoTrainer:
 
                 for k_viz in range(num_eval_frames): # Iterate over the selected eval frames
                     frame_image = np.zeros((frame_h_viz, frame_w_viz, 3), dtype=np.uint8)
-                    xyz_k_norm = xyz_for_viz[k_viz] # (N, 2) for current eval frame
+                    xyz_k_norm_all = xyz_for_viz[k_viz] # (N, 2) for current eval frame, all gaussians
+                    xyz_k_norm_viz = xyz_k_norm_all[visualized_gaussian_indices] # Select subset for viz
 
-                    x_coords = ((xyz_k_norm[:, 0] * 0.5 + 0.5) * frame_w_viz).numpy().astype(int)
-                    y_coords = ((xyz_k_norm[:, 1] * 0.5 + 0.5) * frame_h_viz).numpy().astype(int)
+                    x_coords = ((xyz_k_norm_viz[:, 0] * 0.5 + 0.5) * frame_w_viz).numpy().astype(int)
+                    y_coords = ((xyz_k_norm_viz[:, 1] * 0.5 + 0.5) * frame_h_viz).numpy().astype(int)
 
-                    for i in range(self.gaussian_model.num_points):
-                        pt_center = (x_coords[i], y_coords[i])
-                        point_color_bgr = tuple(static_colors_bgr_uint8[i].tolist())
+                    for i_viz in range(num_gaussians_in_viz): # Iterate over selected Gaussians
+                        pt_center = (x_coords[i_viz], y_coords[i_viz])
+                        point_color_bgr = tuple(static_colors_bgr_uint8_viz[i_viz].tolist())
                         if 0 <= pt_center[0] < frame_w_viz and 0 <= pt_center[1] < frame_h_viz:
                             cv2.circle(frame_image, pt_center, dot_radius, point_color_bgr, -1)
                     centers_video_writer.write(frame_image)
@@ -471,6 +494,9 @@ def parse_args(argv):
     parser.add_argument("--lambda_xyz_coeffs_reg", type=float, default=0.0, help="Strength of L2 regularization on XYZ polynomial coeffs (default: %(default)s)")
     parser.add_argument("--lambda_cholesky_coeffs_reg", type=float, default=0.0, help="Strength of L2 regularization on Cholesky polynomial coeffs (default: %(default)s)")
     parser.add_argument("--lambda_opacity_coeffs_reg", type=float, default=0.0, help="Strength of L2 regularization on opacity polynomial coeffs (default: %(default)s)")
+
+    # New arguments for initialization
+    parser.add_argument("--initialization_logit_eps", type=float, default=1e-6, help="Epsilon for logit calculation during initialization (default: %(default)s)")
 
     # Remove old/unused arguments
     # parser.add_argument("--images", type=str, default="images", help="Path to training images folder (default: %(default)s)")
