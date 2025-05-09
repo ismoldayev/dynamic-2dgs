@@ -61,7 +61,7 @@ class EMA:
         return self.shadow_params
 
 class GaussianImage_Cholesky(nn.Module):
-    def __init__(self, loss_type="L2", T=1, lambda_opacity_reg=0.0, lambda_temporal_xyz=0.0, lambda_temporal_cholesky=0.0, lambda_accel_xyz=0.0, lambda_accel_cholesky=0.0, lambda_neighbor_rigidity=0.0, k_neighbors=5, ema_decay=0.999, **kwargs):
+    def __init__(self, loss_type="L2", T=1, lambda_opacity_reg=0.0, lambda_temporal_xyz=0.0, lambda_temporal_cholesky=0.0, lambda_accel_xyz=0.0, lambda_accel_cholesky=0.0, lambda_neighbor_rigidity=0.0, k_neighbors=5, ema_decay=0.999, polynomial_degree=1, **kwargs):
         super().__init__()
         self.loss_type = loss_type
         self.num_points = kwargs["num_points"]
@@ -79,19 +79,47 @@ class GaussianImage_Cholesky(nn.Module):
             (self.W + self.BLOCK_W - 1) // self.BLOCK_W,
             (self.H + self.BLOCK_H - 1) // self.BLOCK_H,
             1,
-        ) #
+        )
         self.device = kwargs["device"]
 
-        # Time-varying parameters: shape (T, N, ...)
-        # Initialize _xyz to be random for each Gaussian across all frames
-        self._xyz = nn.Parameter(torch.atanh(2 * (torch.rand(self.T, self.num_points, 2, device=self.device) - 0.5)))
+        self.polynomial_degree = polynomial_degree # Use passed-in degree
+        num_coeffs = self.polynomial_degree + 1
 
-        # Initialize cholesky near identity (small off-diag, positive diag)
-        # Initialize _cholesky to be the same for each Gaussian across all frames (current setup)
-        init_chol_base = torch.tensor([1.0, 0.0, 1.0], device=self.device).view(1, 3) # Shape (1, 3)
-        noise_per_gaussian = torch.randn(self.num_points, 3, device=self.device) * 0.01 # Shape (N, 3)
-        initial_cholesky_per_gaussian = init_chol_base.repeat(self.num_points, 1) + noise_per_gaussian # Shape (N, 3)
-        self._cholesky = nn.Parameter(initial_cholesky_per_gaussian.unsqueeze(0).repeat(self.T, 1, 1))
+        # Time values for polynomial evaluation, normalized from 0 to 1
+        if self.T > 0:
+            t_values = torch.linspace(0, 1, self.T, device=self.device)
+        else: # Should not happen in practice, but handle gracefully
+            t_values = torch.empty(0, device=self.device)
+        self.register_buffer('t_values', t_values, persistent=False)
+
+        # Create t_power_matrix: (T, num_coeffs) where each row is [t^0, t^1, ..., t^degree]
+        if self.T > 0:
+            t_power_matrix_list = [torch.ones_like(self.t_values).unsqueeze(1)] # t^0
+            if self.polynomial_degree > 0:
+                for i in range(1, self.polynomial_degree + 1):
+                    t_power_matrix_list.append(self.t_values.pow(i).unsqueeze(1))
+            t_power_matrix = torch.cat(t_power_matrix_list, dim=1)
+        else:
+            t_power_matrix = torch.empty(0, num_coeffs, device=self.device)
+        self.register_buffer('t_power_matrix', t_power_matrix, persistent=False)
+
+
+        # Initialize _xyz_coeffs: (num_coeffs, N, 2)
+        # c0 (constant term) is random
+        initial_xyz_c0 = torch.atanh(2 * (torch.rand(self.num_points, 2, device=self.device) - 0.5))
+        # c1...cD (higher order terms) are zero for constant initialization
+        higher_order_xyz_coeffs = torch.zeros(self.polynomial_degree, self.num_points, 2, device=self.device)
+        self._xyz_coeffs = nn.Parameter(torch.cat([initial_xyz_c0.unsqueeze(0), higher_order_xyz_coeffs], dim=0))
+
+
+        # Initialize _cholesky_coeffs: (num_coeffs, N, 3)
+        # c0 (constant term) is random (near identity)
+        init_chol_base_c0 = torch.tensor([1.0, 0.0, 1.0], device=self.device).view(1, 3)
+        noise_per_gaussian_c0 = torch.randn(self.num_points, 3, device=self.device) * 0.01
+        initial_cholesky_c0 = init_chol_base_c0.repeat(self.num_points, 1) + noise_per_gaussian_c0
+        # c1...cD (higher order terms) are zero
+        higher_order_cholesky_coeffs = torch.zeros(self.polynomial_degree, self.num_points, 3, device=self.device)
+        self._cholesky_coeffs = nn.Parameter(torch.cat([initial_cholesky_c0.unsqueeze(0), higher_order_cholesky_coeffs], dim=0))
 
         # Static parameters: shape (N, ...)
         self._opacity = nn.Parameter(torch.ones((self.num_points, 1), device=self.device))
@@ -110,11 +138,10 @@ class GaussianImage_Cholesky(nn.Module):
         self.ema_decay = ema_decay # Store decay rate
 
         if self.lambda_temporal_xyz > 0:
-            # EMA expects a list of parameters. For self._xyz, it's a single parameter.
-            self.ema_xyz = EMA([self._xyz], decay=self.ema_decay)
+            self.ema_xyz = EMA([self._xyz_coeffs], decay=self.ema_decay) # Track coefficients
 
         if self.lambda_temporal_cholesky > 0:
-            self.ema_cholesky = EMA([self._cholesky], decay=self.ema_decay)
+            self.ema_cholesky = EMA([self._cholesky_coeffs], decay=self.ema_decay) # Track coefficients
 
         if kwargs["opt_type"] == "adam":
             self.optimizer = torch.optim.Adam(self.parameters(), lr=kwargs["lr"])
@@ -144,13 +171,16 @@ class GaussianImage_Cholesky(nn.Module):
             if self.lambda_neighbor_rigidity > 0:
                 print("Warning: Neighbor rigidity loss not initialized due to insufficient points, T<=1, or k_neighbors<=0.")
 
-    # def _init_data(self):
-    #     self.cholesky_quantizer._init_data(self._cholesky)
-
     @property
     def get_xyz(self):
-        """Returns means for all frames, shape (T, N, 2)."""
-        return torch.tanh(self._xyz)
+        """Evaluates polynomial for means, returns (T, N, 2)."""
+        if self.T == 0:
+            return torch.empty(0, self.num_points, 2, device=self.device)
+        # self._xyz_coeffs: (num_coeffs, N, 2)
+        # self.t_power_matrix: (T, num_coeffs)
+        # einsum: d=num_coeffs, n=num_points, p=param_dim(2), t=time
+        evaluated_xyz = torch.einsum('dnp,td->tnp', self._xyz_coeffs, self.t_power_matrix)
+        return torch.tanh(evaluated_xyz)
 
     @property
     def get_features(self):
@@ -166,10 +196,14 @@ class GaussianImage_Cholesky(nn.Module):
 
     @property
     def get_cholesky_elements(self):
-        """Returns Cholesky elements for all frames, shape (T, N, 3)."""
-        # Add bound - Note: This was likely for initialization constraints, may need adjustment.
-        # Ensure cholesky_bound broadcasts correctly: (1, 1, 3)
-        return self._cholesky + self.cholesky_bound
+        """Evaluates polynomial for Cholesky elements, returns (T, N, 3)."""
+        if self.T == 0:
+            return torch.empty(0, self.num_points, 3, device=self.device)
+        # self._cholesky_coeffs: (num_coeffs, N, 3)
+        # self.t_power_matrix: (T, num_coeffs)
+        # einsum: d=num_coeffs, n=num_points, p=param_dim(3), t=time
+        evaluated_cholesky = torch.einsum('dnp,td->tnp', self._cholesky_coeffs, self.t_power_matrix)
+        return evaluated_cholesky + self.cholesky_bound
 
     def forward(self, frame_index=None, background_color_override=None):
         """Render either a specific frame or all frames.

@@ -237,13 +237,22 @@ def video_path_to_tensor(video_path, num_frames=None, target_size=None):
                 original_w, original_h = img.size
                 print(f"Original Frame size: ({original_w}, {original_h})")
                 if target_size is None:
-                    # Heuristic resizing to aim for roughly 512*512 pixels
-                    target_pixel_count = 512 * 512 # <--- Changed target pixel count
-                    scale = math.sqrt(target_pixel_count / (original_w * original_h)) if (original_w * original_h > 0) else 1.0
+                    # Heuristic resizing to aim for roughly 256*256 pixels
+                    target_pixel_count = 256 * 256
+                    if original_w * original_h > 0: # Check to avoid division by zero
+                        if original_w * original_h > target_pixel_count:
+                            # Only scale down if the original is larger than the target
+                            scale = math.sqrt(target_pixel_count / (original_w * original_h))
+                        else:
+                            # If original is smaller or equal, do not scale up
+                            scale = 1.0
+                    else:
+                        scale = 1.0 # Fallback scale if original dimensions are invalid
+
                     target_w = max(16, int(round(original_w * scale / 16)) * 16)
                     target_h = max(16, int(round(original_h * scale / 16)) * 16)
                     current_target_size = (target_w, target_h)
-                    print(f"Resizing selected frames to: {current_target_size}")
+                    print(f"Resizing selected frames to: {current_target_size} (Original: {original_w}x{original_h}, Target Pixels: ~{target_pixel_count}, Scale: {scale:.4f})")
                 else:
                     current_target_size = target_size
                     print(f"Using provided target size: {current_target_size}")

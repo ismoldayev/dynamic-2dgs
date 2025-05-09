@@ -55,10 +55,11 @@ class VideoTrainer:
         accel_xyz_str = f"_accelXYZ{args.lambda_accel_xyz:.0e}".replace("e-0", "e-") if args.lambda_accel_xyz > 0 else ""
         accel_chol_str = f"_accelChol{args.lambda_accel_cholesky:.0e}".replace("e-0", "e-") if args.lambda_accel_cholesky > 0 else ""
         rigidity_str = f"_rigidN{args.k_neighbors}L{args.lambda_neighbor_rigidity:.0e}".replace("e-0", "e-") if args.lambda_neighbor_rigidity > 0 else ""
+        poly_deg_str = f"_polyDeg{args.polynomial_degree}"
         # color_reg_str = f"_colorReg{args.lambda_color_reg:.0e}".replace("e-0", "e-") # Removed
 
         # Add more params to log_dir name for better tracking
-        self.log_dir = Path(f"./checkpoints/{self.video_name}/iter{args.iterations}_pts{num_points}_frames{self.T}{opacity_reg_str}{temporal_xyz_str}{temporal_chol_str}{accel_xyz_str}{accel_chol_str}{rigidity_str}_lr{args.lr:.0e}")
+        self.log_dir = Path(f"./checkpoints/{self.video_name}/iter{args.iterations}_pts{num_points}_frames{self.T}{opacity_reg_str}{temporal_xyz_str}{temporal_chol_str}{accel_xyz_str}{accel_chol_str}{rigidity_str}{poly_deg_str}_lr{args.lr:.0e}")
         self.log_dir.mkdir(parents=True, exist_ok=True)
         print(f"Logging to: {self.log_dir}")
 
@@ -79,6 +80,7 @@ class VideoTrainer:
             lambda_accel_cholesky=args.lambda_accel_cholesky,
             lambda_neighbor_rigidity=args.lambda_neighbor_rigidity,
             k_neighbors=args.k_neighbors,
+            polynomial_degree=args.polynomial_degree,
             # lambda_color_reg=args.lambda_color_reg # Removed
         ).to(self.device)
 
@@ -373,6 +375,7 @@ def parse_args(argv):
     parser.add_argument("--lr_delay_steps", type=int, default=0, help="Learning rate delay steps (default: %(default)s)") # From 3DGS
     parser.add_argument("--output_video_fps", type=float, default=25.0, help="FPS for the output rendered video (default: %(default)s)")
     parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay rate for temporal regularization")
+    parser.add_argument("--polynomial_degree", type=int, default=7, help="Degree of the polynomial for time representation (default: %(default)s)")
 
     # Remove old/unused arguments
     # parser.add_argument("--images", type=str, default="images", help="Path to training images folder (default: %(default)s)")
@@ -404,8 +407,9 @@ def main(argv):
 
     try:
         gt_frames_tensor = video_path_to_tensor(video_path, num_frames=args.num_frames)
+
     except Exception as e:
-        print(f"Error loading video: {e}")
+        print(f"Error loading video: {e}") # Adjusted to be generic again if the resize block above is what's causing error prints
         sys.exit(1)
 
     # --- Run Training for the single video --- #
