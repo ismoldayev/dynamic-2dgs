@@ -7,6 +7,7 @@ import numpy as np
 import math
 # from quantize import *
 from optimizer import Adan
+from typing import Optional
 
 class EMA:
     """Exponential Moving Average for PyTorch Models"""
@@ -61,19 +62,17 @@ class EMA:
         return self.shadow_params
 
 class GaussianImage_Cholesky(nn.Module):
-    def __init__(self, loss_type="L2", T=1, lambda_opacity_reg=0.0, lambda_temporal_xyz=0.0, lambda_temporal_cholesky=0.0, lambda_accel_xyz=0.0, lambda_accel_cholesky=0.0, lambda_neighbor_rigidity=0.0, k_neighbors=5, ema_decay=0.999, polynomial_degree=1, **kwargs):
+    def __init__(self, loss_type="L2", T=1, lambda_neighbor_rigidity=0.0, k_neighbors=5, ema_decay=0.999, polynomial_degree=1, lambda_xyz_coeffs_reg=0.0, lambda_cholesky_coeffs_reg=0.0, lambda_opacity_coeffs_reg=0.0, opacity_polynomial_degree=None, **kwargs):
         super().__init__()
         self.loss_type = loss_type
         self.num_points = kwargs["num_points"]
         self.H, self.W = kwargs["H"], kwargs["W"]
         self.T = T # Number of frames
-        self.lambda_opacity_reg = lambda_opacity_reg
-        self.lambda_temporal_xyz = lambda_temporal_xyz
-        self.lambda_temporal_cholesky = lambda_temporal_cholesky
-        self.lambda_accel_xyz = lambda_accel_xyz
-        self.lambda_accel_cholesky = lambda_accel_cholesky
         self.lambda_neighbor_rigidity = lambda_neighbor_rigidity
         self.k_neighbors = k_neighbors
+        self.lambda_xyz_coeffs_reg = lambda_xyz_coeffs_reg
+        self.lambda_cholesky_coeffs_reg = lambda_cholesky_coeffs_reg
+        self.lambda_opacity_coeffs_reg = lambda_opacity_coeffs_reg
         self.BLOCK_W, self.BLOCK_H = kwargs["BLOCK_W"], kwargs["BLOCK_H"]
         self.tile_bounds = (
             (self.W + self.BLOCK_W - 1) // self.BLOCK_W,
@@ -83,7 +82,10 @@ class GaussianImage_Cholesky(nn.Module):
         self.device = kwargs["device"]
 
         self.polynomial_degree = polynomial_degree # Use passed-in degree
-        num_coeffs = self.polynomial_degree + 1
+        self.opacity_polynomial_degree = opacity_polynomial_degree if opacity_polynomial_degree is not None else polynomial_degree
+
+        num_coeffs_xyz_chol = self.polynomial_degree + 1
+        num_coeffs_opacity = self.opacity_polynomial_degree + 1
 
         # Time values for polynomial evaluation, normalized from 0 to 1
         if self.T > 0:
@@ -100,11 +102,25 @@ class GaussianImage_Cholesky(nn.Module):
                     t_power_matrix_list.append(self.t_values.pow(i).unsqueeze(1))
             t_power_matrix = torch.cat(t_power_matrix_list, dim=1)
         else:
-            t_power_matrix = torch.empty(0, num_coeffs, device=self.device)
+            t_power_matrix = torch.empty(0, num_coeffs_xyz_chol, device=self.device)
         self.register_buffer('t_power_matrix', t_power_matrix, persistent=False)
 
+        # Create t_power_matrix for opacity if its degree is different
+        if self.polynomial_degree == self.opacity_polynomial_degree:
+            self.t_power_matrix_opacity = t_power_matrix
+        else:
+            if self.T > 0:
+                t_power_matrix_opacity_list = [torch.ones_like(self.t_values).unsqueeze(1)] # t^0
+                if self.opacity_polynomial_degree > 0:
+                    for i in range(1, self.opacity_polynomial_degree + 1):
+                        t_power_matrix_opacity_list.append(self.t_values.pow(i).unsqueeze(1))
+                t_power_matrix_opacity = torch.cat(t_power_matrix_opacity_list, dim=1)
+            else:
+                t_power_matrix_opacity = torch.empty(0, num_coeffs_opacity, device=self.device)
+            self.register_buffer('t_power_matrix_opacity', t_power_matrix_opacity, persistent=False)
 
-        # Initialize _xyz_coeffs: (num_coeffs, N, 2)
+
+        # Initialize _xyz_coeffs: (num_coeffs_xyz_chol, N, 2)
         # c0 (constant term) is random
         initial_xyz_c0 = torch.atanh(2 * (torch.rand(self.num_points, 2, device=self.device) - 0.5))
         # c1...cD (higher order terms) are zero for constant initialization
@@ -112,7 +128,7 @@ class GaussianImage_Cholesky(nn.Module):
         self._xyz_coeffs = nn.Parameter(torch.cat([initial_xyz_c0.unsqueeze(0), higher_order_xyz_coeffs], dim=0))
 
 
-        # Initialize _cholesky_coeffs: (num_coeffs, N, 3)
+        # Initialize _cholesky_coeffs: (num_coeffs_xyz_chol, N, 3)
         # c0 (constant term) is random (near identity)
         init_chol_base_c0 = torch.tensor([1.0, 0.0, 1.0], device=self.device).view(1, 3)
         noise_per_gaussian_c0 = torch.randn(self.num_points, 3, device=self.device) * 0.01
@@ -121,8 +137,15 @@ class GaussianImage_Cholesky(nn.Module):
         higher_order_cholesky_coeffs = torch.zeros(self.polynomial_degree, self.num_points, 3, device=self.device)
         self._cholesky_coeffs = nn.Parameter(torch.cat([initial_cholesky_c0.unsqueeze(0), higher_order_cholesky_coeffs], dim=0))
 
-        # Static parameters: shape (N, ...)
-        self._opacity = nn.Parameter(torch.ones((self.num_points, 1), device=self.device))
+        # Initialize _opacity_coeffs: (num_coeffs_opacity, N, 1)
+        # c0 (constant term) initialized to give opacity of 0.5 initially (logit(0.5)=0)
+        initial_opacity_c0 = torch.zeros(self.num_points, 1, device=self.device)
+        # c1...cD (higher order terms) are zero
+        higher_order_opacity_coeffs = torch.zeros(self.opacity_polynomial_degree, self.num_points, 1, device=self.device)
+        self._opacity_coeffs = nn.Parameter(torch.cat([initial_opacity_c0.unsqueeze(0), higher_order_opacity_coeffs], dim=0))
+
+        # Static parameters: features_dc are still static for now
+        # self._opacity = nn.Parameter(torch.ones((self.num_points, 1), device=self.device))) # Old static opacity
         self._features_dc = nn.Parameter(torch.randn(self.num_points, 3, device=self.device))
 
         self.last_size = (self.H, self.W)
@@ -137,10 +160,10 @@ class GaussianImage_Cholesky(nn.Module):
         self.ema_cholesky = None
         self.ema_decay = ema_decay # Store decay rate
 
-        if self.lambda_temporal_xyz > 0:
+        if self.lambda_xyz_coeffs_reg > 0:
             self.ema_xyz = EMA([self._xyz_coeffs], decay=self.ema_decay) # Track coefficients
 
-        if self.lambda_temporal_cholesky > 0:
+        if self.lambda_cholesky_coeffs_reg > 0:
             self.ema_cholesky = EMA([self._cholesky_coeffs], decay=self.ema_decay) # Track coefficients
 
         if kwargs["opt_type"] == "adam":
@@ -171,16 +194,57 @@ class GaussianImage_Cholesky(nn.Module):
             if self.lambda_neighbor_rigidity > 0:
                 print("Warning: Neighbor rigidity loss not initialized due to insufficient points, T<=1, or k_neighbors<=0.")
 
+    def _get_evaluated_polynomials(self, t_values_for_eval: torch.Tensor):
+        """Helper to evaluate all time-varying polynomials for a given set of t_values."""
+        if t_values_for_eval.numel() == 0:
+            num_coeffs_xyz_chol = self.polynomial_degree + 1
+            num_coeffs_opacity = self.opacity_polynomial_degree + 1
+            # Return empty tensors with correct trailing dimensions
+            return (
+                torch.empty(0, self.num_points, 2, device=self.device),
+                torch.empty(0, self.num_points, 3, device=self.device),
+                torch.empty(0, self.num_points, 1, device=self.device)
+            )
+
+        # Evaluate t_power_matrix for XYZ and Cholesky
+        t_power_matrix_eval_list_xyz_chol = [torch.ones_like(t_values_for_eval).unsqueeze(1)] # t^0
+        if self.polynomial_degree > 0:
+            for i in range(1, self.polynomial_degree + 1):
+                t_power_matrix_eval_list_xyz_chol.append(t_values_for_eval.pow(i).unsqueeze(1))
+        t_power_matrix_eval_xyz_chol = torch.cat(t_power_matrix_eval_list_xyz_chol, dim=1)
+
+        # Evaluate t_power_matrix for Opacity
+        if self.polynomial_degree == self.opacity_polynomial_degree:
+            t_power_matrix_eval_opacity = t_power_matrix_eval_xyz_chol
+        else:
+            t_power_matrix_eval_list_opacity = [torch.ones_like(t_values_for_eval).unsqueeze(1)] # t^0
+            if self.opacity_polynomial_degree > 0:
+                for i in range(1, self.opacity_polynomial_degree + 1):
+                    t_power_matrix_eval_list_opacity.append(t_values_for_eval.pow(i).unsqueeze(1))
+            t_power_matrix_eval_opacity = torch.cat(t_power_matrix_eval_list_opacity, dim=1)
+
+
+        # xyz: (num_coeffs, N, 2) @ (T_eval, num_coeffs)^T -> (N, 2, T_eval) -> (T_eval, N, 2)
+        evaluated_xyz_logits = torch.einsum('dnp,td->tnp', self._xyz_coeffs, t_power_matrix_eval_xyz_chol)
+        evaluated_xyz = torch.tanh(evaluated_xyz_logits)
+
+        # cholesky: (num_coeffs, N, 3) @ (T_eval, num_coeffs)^T -> (N, 3, T_eval) -> (T_eval, N, 3)
+        evaluated_cholesky_raw = torch.einsum('dnp,td->tnp', self._cholesky_coeffs, t_power_matrix_eval_xyz_chol)
+        evaluated_cholesky = evaluated_cholesky_raw + self.cholesky_bound
+
+        # opacity: (num_coeffs, N, 1) @ (T_eval, num_coeffs)^T -> (N, 1, T_eval) -> (T_eval, N, 1)
+        evaluated_opacity_logits = torch.einsum('dnp,td->tnp', self._opacity_coeffs, t_power_matrix_eval_opacity)
+        evaluated_opacity = self.opacity_activation(evaluated_opacity_logits)
+
+        return evaluated_xyz, evaluated_cholesky, evaluated_opacity
+
     @property
     def get_xyz(self):
-        """Evaluates polynomial for means, returns (T, N, 2)."""
+        """Evaluates polynomial for means for ALL self.T frames, returns (T, N, 2)."""
         if self.T == 0:
             return torch.empty(0, self.num_points, 2, device=self.device)
-        # self._xyz_coeffs: (num_coeffs, N, 2)
-        # self.t_power_matrix: (T, num_coeffs)
-        # einsum: d=num_coeffs, n=num_points, p=param_dim(2), t=time
-        evaluated_xyz = torch.einsum('dnp,td->tnp', self._xyz_coeffs, self.t_power_matrix)
-        return torch.tanh(evaluated_xyz)
+        evaluated_xyz_logits = torch.einsum('dnp,td->tnp', self._xyz_coeffs, self.t_power_matrix)
+        return torch.tanh(evaluated_xyz_logits)
 
     @property
     def get_features(self):
@@ -190,141 +254,137 @@ class GaussianImage_Cholesky(nn.Module):
 
     @property
     def get_opacity(self):
-        """Returns opacities, shape (N, 1)."""
-        # Apply activation
-        return self.opacity_activation(self._opacity)
+        """Evaluates polynomial for opacities for ALL self.T frames, returns (T, N, 1)."""
+        if self.T == 0:
+            return torch.empty(0, self.num_points, 1, device=self.device)
+        evaluated_opacity_logits = torch.einsum('dnp,td->tnp', self._opacity_coeffs, self.t_power_matrix_opacity)
+        return self.opacity_activation(evaluated_opacity_logits)
 
     @property
     def get_cholesky_elements(self):
-        """Evaluates polynomial for Cholesky elements, returns (T, N, 3)."""
+        """Evaluates polynomial for Cholesky elements for ALL self.T frames, returns (T, N, 3)."""
         if self.T == 0:
             return torch.empty(0, self.num_points, 3, device=self.device)
-        # self._cholesky_coeffs: (num_coeffs, N, 3)
-        # self.t_power_matrix: (T, num_coeffs)
-        # einsum: d=num_coeffs, n=num_points, p=param_dim(3), t=time
-        evaluated_cholesky = torch.einsum('dnp,td->tnp', self._cholesky_coeffs, self.t_power_matrix)
-        return evaluated_cholesky + self.cholesky_bound
+        evaluated_cholesky_raw = torch.einsum('dnp,td->tnp', self._cholesky_coeffs, self.t_power_matrix)
+        return evaluated_cholesky_raw + self.cholesky_bound
 
-    def forward(self, frame_index=None, background_color_override=None):
-        """Render either a specific frame or all frames.
-
-        Args:
-            frame_index (int, optional): If specified, render only this frame.
-                                       Otherwise, render all frames.
-            background_color_override (torch.Tensor, optional): If provided, use this as the background color.
-                                                              Otherwise, defaults to white.
-
-        Returns:
-            dict: Dictionary containing the rendered image(s).
-                  If frame_index is given, "render" has shape (1, C, H, W).
-                  Otherwise, "render" has shape (T, C, H, W).
+    def get_xyz_dynamics_ranking_indices(self, top_k_percentage=0.10):
+        """Calculates a metric for Gaussian XYZ dynamics based on non-constant polynomial coefficients
+           and returns the indices of the top_k_percentage most dynamic Gaussians.
         """
+        if self.polynomial_degree == 0 or self.num_points == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device) # No non-constant terms or no points
 
-        if background_color_override is not None:
-            active_background = background_color_override
-        else:
-            active_background = torch.ones(3, device=self.device) # Default to white (was torch.zeros for black)
+        # self._xyz_coeffs shape: (num_coeffs, N, 2)
+        # Non-constant coefficients are _xyz_coeffs[1:]
+        non_constant_xyz_coeffs = self._xyz_coeffs[1:] # Shape: (polynomial_degree, N, 2)
 
-        if frame_index is not None:
-            # Render a single frame t
-            means_t = self.get_xyz[frame_index] # (N, 2)
-            cholesky_t = self.get_cholesky_elements[frame_index] # (N, 3)
-            colors = self.get_features # (N, 3)
-            opacities = self.get_opacity # (N, 1)
+        # Calculate L2 norm of non-constant coefficients for each Gaussian
+        # Sum of squares of these coefficient components for each Gaussian
+        # Sum over polynomial_degree (dim 0) and coordinate dimension (dim 2)
+        movement_metric = torch.sum(non_constant_xyz_coeffs**2, dim=(0, 2)) # Shape: (N)
 
-            # gsplat expects N x D input, project_gaussians_2d takes means and cholesky separately
-            xys, depths, radii, conics, num_tiles_hit = project_gaussians_2d(
-                means_t, cholesky_t, self.H, self.W, self.tile_bounds
+        if movement_metric.numel() == 0: # Should be caught by num_points == 0 but as a safeguard
+             return torch.empty(0, dtype=torch.long, device=self.device)
+
+        num_top_k = min(self.num_points, max(0, int(self.num_points * top_k_percentage)))
+        if num_top_k == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+
+        _, top_indices = torch.topk(movement_metric, k=num_top_k)
+        return top_indices
+
+    def forward(self, t_values_to_render: Optional[torch.Tensor] = None, background_color_override: Optional[torch.Tensor] = None):
+        """Render frames specified by t_values_to_render.
+        If t_values_to_render is None, renders all self.T frames.
+        """
+        if t_values_to_render is None:
+            t_values_to_render = self.t_values # Use all stored t_values if none are provided
+            if self.T == 0: # No frames to render if model T is 0
+                 return {"render": torch.empty(0, 3, self.H, self.W, device=self.device)}
+        elif t_values_to_render.numel() == 0:
+            # If specific t_values are provided but empty, render nothing
+            return {"render": torch.empty(0, 3, self.H, self.W, device=self.device)}
+
+        num_frames_to_render = t_values_to_render.shape[0]
+        active_background = background_color_override if background_color_override is not None else torch.ones(3, device=self.device)
+
+        # Get all parameters evaluated at the specified t_values
+        evaluated_xyz, evaluated_cholesky, evaluated_opacity = self._get_evaluated_polynomials(t_values_to_render)
+        static_colors = self.get_features # (N, 3), still static
+
+        all_frames_rendered = []
+        for k in range(num_frames_to_render):
+            means_k = evaluated_xyz[k]             # (N, 2)
+            cholesky_k = evaluated_cholesky[k]       # (N, 3)
+            opacities_k = evaluated_opacity[k]         # (N, 1)
+
+            xys, depths_from_projection, radii, conics, num_tiles_hit = project_gaussians_2d(
+                means_k, cholesky_k, self.H, self.W, self.tile_bounds
             )
-            # rasterize_gaussians_sum expects N x D input for colors and opacities
-            out_img = rasterize_gaussians_sum(
-                xys, depths, radii, conics, num_tiles_hit,
-                colors, opacities, self.H, self.W, self.BLOCK_H, self.BLOCK_W,
+            effective_depths = 1.0 - opacities_k
+
+            out_img_k = rasterize_gaussians_sum(
+                xys, effective_depths, radii, conics, num_tiles_hit,
+                static_colors, opacities_k,
+                self.H, self.W, self.BLOCK_H, self.BLOCK_W,
                 background=active_background, return_alpha=False
             )
-            out_img = torch.clamp(out_img, 0, 1) #[H, W, 3]
-            # Reshape to (1, C, H, W)
-            out_img = out_img.view(1, self.H, self.W, 3).permute(0, 3, 1, 2).contiguous()
-            return {"render": out_img}
-        else:
-            # Render all frames (can be memory intensive)
-            all_frames_rendered = []
-            for t in range(self.T):
-                # Pass the background_color_override to recursive calls
-                frame_render_pkg = self.forward(frame_index=t, background_color_override=active_background)
-                all_frames_rendered.append(frame_render_pkg["render"])
-            # Stack along the time dimension
-            all_frames_tensor = torch.cat(all_frames_rendered, dim=0) # (T, C, H, W)
-            return {"render": all_frames_tensor}
+            out_img_k = torch.clamp(out_img_k, 0, 1) # [H, W, 3]
+            all_frames_rendered.append(out_img_k.permute(2,0,1)) # To C, H, W
 
-    def train_iter(self, gt_frames):
-        """Performs one training iteration using all frames.
+        if not all_frames_rendered:
+             return {"render": torch.empty(0, 3, self.H, self.W, device=self.device)}
 
-        Args:
-            gt_frames (torch.Tensor): Ground truth video frames (T, C, H, W).
+        final_rendered_tensor = torch.stack(all_frames_rendered, dim=0) # (num_frames_to_render, C, H, W)
+        return {"render": final_rendered_tensor}
 
-        Returns:
-            tuple: Average loss and average PSNR across all frames.
-        """
+    def train_iter(self, gt_frames_batch: torch.Tensor, t_values_batch: torch.Tensor):
+        """Performs one training iteration using a batch of frames and their t_values."""
         total_loss = 0
         total_psnr = 0
+        T_batch = gt_frames_batch.shape[0]
 
-        # Generate a random background color for this iteration
-        # iter_random_background = torch.rand(3, device=self.device) # Removed for always-white background
+        if T_batch == 0: # Should be caught by caller, but as a safeguard
+            return 0.0, 0.0
 
-        # Render all frames using the default background (now white)
-        rendered_frames_pkg = self.forward() # Removed background_color_override
-        rendered_frames = rendered_frames_pkg["render"]
+        rendered_frames_pkg = self.forward(t_values_to_render=t_values_batch)
+        rendered_frames = rendered_frames_pkg["render"] # (T_batch, C, H, W)
 
-        # Calculate loss and PSNR per frame and average
-        for t in range(self.T):
-            loss_t = loss_fn(rendered_frames[t:t+1], gt_frames[t:t+1], self.loss_type, lambda_value=0.7)
+        # Calculate loss and PSNR per frame in the batch and average
+        for t_idx_in_batch in range(T_batch):
+            loss_t = loss_fn(rendered_frames[t_idx_in_batch:t_idx_in_batch+1], gt_frames_batch[t_idx_in_batch:t_idx_in_batch+1], self.loss_type, lambda_value=0.7)
             total_loss += loss_t
             with torch.no_grad():
-                mse_loss_t = F.mse_loss(rendered_frames[t:t+1], gt_frames[t:t+1])
-                psnr_t = 10 * math.log10(1.0 / mse_loss_t.item())
+                mse_loss_t = F.mse_loss(rendered_frames[t_idx_in_batch:t_idx_in_batch+1], gt_frames_batch[t_idx_in_batch:t_idx_in_batch+1])
+                psnr_t = 10 * math.log10(1.0 / max(mse_loss_t.item(), 1e-10)) # Avoid log(0)
                 total_psnr += psnr_t
 
-        average_loss = total_loss / self.T
-        average_psnr = total_psnr / self.T
+        average_loss = total_loss / T_batch
+        average_psnr = total_psnr / T_batch
 
-        # Add L1 opacity regularization
-        # We penalize the raw logits _opacity to encourage them to be negative (pushing sigmoid towards 0)
-        # Or, penalize the output of get_opacity directly (simpler to reason about scale)
-        if self.lambda_opacity_reg > 0:
-            opacity_values = self.get_opacity # These are already sigmoid-ed
-            opacity_reg_loss = self.lambda_opacity_reg * torch.mean(opacity_values)
-            average_loss += opacity_reg_loss
+        # Add L2 regularization on polynomial coefficients (excluding constant term)
+        if self.polynomial_degree > 0:
+            if self.lambda_xyz_coeffs_reg > 0:
+                # _xyz_coeffs shape: (num_coeffs, N, 2)
+                # Regularize coeffs[1:] (linear term upwards)
+                xyz_coeffs_to_reg = self._xyz_coeffs[1:]
+                xyz_coeffs_l2_loss = self.lambda_xyz_coeffs_reg * torch.mean(xyz_coeffs_to_reg**2)
+                average_loss += xyz_coeffs_l2_loss
 
-        # Add temporal consistency regularization for XYZ
-        if self.lambda_temporal_xyz > 0 and self.T > 1:
-            xyz_params = self.get_xyz # Shape (T, N, 2)
-            xyz_diff = xyz_params[1:] - xyz_params[:-1] # Differences between frame t and t-1
-            temporal_xyz_loss = self.lambda_temporal_xyz * torch.mean(xyz_diff**2)
-            average_loss += temporal_xyz_loss
+            if self.lambda_cholesky_coeffs_reg > 0:
+                # _cholesky_coeffs shape: (num_coeffs, N, 3)
+                # Regularize coeffs[1:] (linear term upwards)
+                cholesky_coeffs_to_reg = self._cholesky_coeffs[1:]
+                cholesky_coeffs_l2_loss = self.lambda_cholesky_coeffs_reg * torch.mean(cholesky_coeffs_to_reg**2)
+                average_loss += cholesky_coeffs_l2_loss
 
-        # Add temporal consistency regularization for Cholesky components
-        if self.lambda_temporal_cholesky > 0 and self.T > 1:
-            cholesky_params = self.get_cholesky_elements # Shape (T, N, 3)
-            cholesky_diff = cholesky_params[1:] - cholesky_params[:-1]
-            temporal_cholesky_loss = self.lambda_temporal_cholesky * torch.mean(cholesky_diff**2)
-            average_loss += temporal_cholesky_loss
-
-        # Add temporal acceleration regularization for XYZ
-        if self.lambda_accel_xyz > 0 and self.T > 2:
-            xyz_params = self.get_xyz # Shape (T, N, 2)
-            # P[t] - 2*P[t-1] + P[t-2]
-            xyz_accel = xyz_params[2:] - 2 * xyz_params[1:-1] + xyz_params[:-2]
-            temporal_accel_xyz_loss = self.lambda_accel_xyz * torch.mean(xyz_accel**2)
-            average_loss += temporal_accel_xyz_loss
-
-        # Add temporal acceleration regularization for Cholesky components
-        if self.lambda_accel_cholesky > 0 and self.T > 2:
-            cholesky_params = self.get_cholesky_elements # Shape (T, N, 3)
-            # P[t] - 2*P[t-1] + P[t-2]
-            cholesky_accel = cholesky_params[2:] - 2 * cholesky_params[1:-1] + cholesky_params[:-2]
-            temporal_accel_cholesky_loss = self.lambda_accel_cholesky * torch.mean(cholesky_accel**2)
-            average_loss += temporal_accel_cholesky_loss
+            if self.lambda_opacity_coeffs_reg > 0 and self.opacity_polynomial_degree > 0:
+                # _opacity_coeffs shape: (num_coeffs_opacity, N, 1)
+                # Regularize coeffs[1:] (linear term upwards)
+                opacity_coeffs_to_reg = self._opacity_coeffs[1:]
+                opacity_coeffs_l2_loss = self.lambda_opacity_coeffs_reg * torch.mean(opacity_coeffs_to_reg**2)
+                average_loss += opacity_coeffs_l2_loss
 
         # Add neighbor rigidity loss
         if self.lambda_neighbor_rigidity > 0 and self.T > 1 and hasattr(self, 'neighbor_indices') and hasattr(self, 'initial_neighbor_distances'):
@@ -368,9 +428,9 @@ class GaussianImage_Cholesky(nn.Module):
         self.optimizer.step()
 
         # Update EMA for temporal losses if they are active
-        if self.lambda_temporal_xyz > 0 and self.ema_xyz is not None:
+        if self.lambda_xyz_coeffs_reg > 0 and self.ema_xyz is not None:
             self.ema_xyz.update() # EMA object internally refers to the parameter it tracks
-        if self.lambda_temporal_cholesky > 0 and self.ema_cholesky is not None:
+        if self.lambda_cholesky_coeffs_reg > 0 and self.ema_cholesky is not None:
             self.ema_cholesky.update() # EMA object internally refers to the parameter it tracks
 
         self.scheduler.step()
