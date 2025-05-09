@@ -164,57 +164,39 @@ class GaussianImage_Cholesky(nn.Module):
             # Detach initial_xyz_c0 from computation graph for this part as it's an input to init
             initial_xyz_c0_detached = self._xyz_coeffs[0].clone().detach() # Shape (N, 2)
 
-            new_features_dc_list = []
-            new_opacity_c0_logits_list = []
+            # Compute pixel coordinates for all Gaussians simultaneously
+            xy_normalized = torch.tanh(initial_xyz_c0_detached) # Values in [-1, 1)
+            px_all = torch.clamp(torch.round((xy_normalized[:, 0] * 0.5 + 0.5) * (self.W -1)).long(), 0, self.W - 1)
+            py_all = torch.clamp(torch.round((xy_normalized[:, 1] * 0.5 + 0.5) * (self.H -1)).long(), 0, self.H - 1)
 
-            for n in range(self.num_points):
-                # Denormalize XY to pixel coordinates
-                xy_n_normalized = torch.tanh(initial_xyz_c0_detached[n]) # Values in [-1, 1)
-                px = torch.clamp(torch.round((xy_n_normalized[0] * 0.5 + 0.5) * (self.W -1)).long(), 0, self.W - 1)
-                py = torch.clamp(torch.round((xy_n_normalized[1] * 0.5 + 0.5) * (self.H -1)).long(), 0, self.H - 1)
+            # Sample initial colors for all Gaussians from random frames using advanced indexing
+            rand_frame_idx = torch.randint(0, self.T, (self.num_points,), device=self.device)
+            initial_colors_all_n = gt_frames_for_init[rand_frame_idx, :, py_all, px_all] # Shape (N, 3), values in [0,1]
 
-                # Sample color from a random frame
-                rand_frame_idx = torch.randint(0, self.T, (1,), device=self.device).item()
-                # Ensure gt_frames_for_init is on the correct device, though it should be if passed from trainer
-                initial_color_n = gt_frames_for_init[rand_frame_idx, :, py, px].to(self.device) # Shape (3,), values in [0,1]
+            # Compute the logits for _features_dc in a single operation
+            self._features_dc.data = _logit(initial_colors_all_n, initialization_logit_eps)
 
-                new_features_dc_list.append(_logit(initial_color_n, initialization_logit_eps))
+            # For opacity:
+            # Gather all relevant pixel colors from gt_frames_for_init across all time steps for all Gaussian locations
+            gt_pixel_colors_at_n_locations_all_frames = gt_frames_for_init[:, :, py_all, px_all] # Shape (T, 3, N)
 
-                # Calculate opacity based on average cosine similarity
-                cosine_similarities_sum = 0.0
-                num_frames_for_avg = 0
-                # Add a small epsilon for cosine similarity denominator stability
-                cosine_sim_eps = 1e-8
+            # Permute gt_pixel_colors_at_n_locations_all_frames to align dimensions for broadcasting: (T, 3, N) -> (N, T, 3)
+            gt_colors_permuted = gt_pixel_colors_at_n_locations_all_frames.permute(2, 0, 1)
+            # initial_colors_all_n.unsqueeze(1) has shape (N, 1, 3)
+            # gt_colors_permuted has shape (N, T, 3)
+            cosine_similarities = F.cosine_similarity(initial_colors_all_n.unsqueeze(1), gt_colors_permuted, dim=2, eps=1e-8) # Shape (N, T)
 
-                for t_idx in range(self.T):
-                    pixel_color_t = gt_frames_for_init[t_idx, :, py, px].to(self.device)
+            # Calculate the average cosine similarity and the target opacity values for all Gaussians
+            avg_cosine_similarity = cosine_similarities.mean(dim=1) # Shape (N)
+            target_opacity_vals = torch.clamp(1.0 - avg_cosine_similarity, 0.0, 1.0) # Shape (N)
 
-                    # Cosine similarity: (A dot B) / (||A|| * ||B|| + eps)
-                    # Colors are in [0,1], so norms are non-negative.
-                    # F.cosine_similarity expects inputs of shape (..., D) and (..., D)
-                    # initial_color_n is (3), pixel_color_t is (3)
-                    # We need to unsqueeze them to (1,3) to make them batch-like for F.cosine_similarity
-                    cos_sim = F.cosine_similarity(initial_color_n.unsqueeze(0), pixel_color_t.unsqueeze(0), dim=1, eps=cosine_sim_eps)
-                    cosine_similarities_sum += cos_sim.item() # cos_sim is a tensor with one element
-                    num_frames_for_avg +=1
+            # Compute the logits for the constant term of _opacity_coeffs
+            opacity_c0_logits = _logit(target_opacity_vals, initialization_logit_eps) # Shape (N)
 
-                avg_cosine_similarity = cosine_similarities_sum / num_frames_for_avg if num_frames_for_avg > 0 else 0.0
-                # Ensure avg_cosine_similarity is within [0,1] as colors are non-negative.
-                # Cosine similarity for non-negative vectors will be [0,1]. Clamping defensively.
-                target_opacity_val = torch.clamp(1.0 - torch.tensor(avg_cosine_similarity, device=self.device), 0.0, 1.0)
-
-                new_opacity_c0_logits_list.append(_logit(target_opacity_val, initialization_logit_eps))
-
-            # Update parameters
-            if new_features_dc_list:
-                self._features_dc.data = torch.stack(new_features_dc_list)
-
-            if new_opacity_c0_logits_list:
-                # _opacity_coeffs has shape (num_coeffs_opacity, N, 1)
-                # We are setting the constant term (coeffs[0])
-                current_opacity_coeffs = self._opacity_coeffs.data.clone()
-                current_opacity_coeffs[0] = torch.stack(new_opacity_c0_logits_list).unsqueeze(-1) # Add channel dim
-                self._opacity_coeffs.data = current_opacity_coeffs
+            # Update the _opacity_coeffs parameter directly with the resulting tensor
+            current_opacity_coeffs = self._opacity_coeffs.data.clone()
+            current_opacity_coeffs[0] = opacity_c0_logits.unsqueeze(-1) # Add channel dim
+            self._opacity_coeffs.data = current_opacity_coeffs
 
             print("Finished custom initialization of color and opacity.")
         else:
@@ -513,162 +495,3 @@ class GaussianImage_Cholesky(nn.Module):
 
         # print(f"Debug: type(average_loss)={type(average_loss)}, type(average_psnr)={type(average_psnr)}")
         return average_loss.item(), average_psnr
-
-    # def forward_quantize(self):
-    #     l_vqm, m_bit = 0, 16*self.init_num_points*2
-    #     means = torch.tanh(self.xyz_quantizer(self._xyz))
-    #     cholesky_elements, l_vqs, s_bit = self.cholesky_quantizer(self._cholesky)
-    #     cholesky_elements = cholesky_elements + self.cholesky_bound
-    #     l_vqr, r_bit = 0, 0
-    #     colors, l_vqc, c_bit = self.features_dc_quantizer(self.get_features)
-    #     self.xys, depths, self.radii, conics, num_tiles_hit = project_gaussians_2d(means, cholesky_elements, self.H, self.W, self.tile_bounds)
-    #     out_img = rasterize_gaussians_sum(self.xys, depths, self.radii, conics, num_tiles_hit,
-    #             colors, self._opacity, self.H, self.W, self.BLOCK_H, self.BLOCK_W, background=self.background, return_alpha=False)
-    #     out_img = torch.clamp(out_img, 0, 1)
-    #     out_img = out_img.view(-1, self.H, self.W, 3).permute(0, 3, 1, 2).contiguous()
-    #     vq_loss = l_vqm + l_vqs + l_vqr + l_vqc
-    #     return {"render": out_img, "vq_loss": vq_loss, "unit_bit":[m_bit, s_bit, r_bit, c_bit]}
-
-    # def train_iter_quantize(self, gt_image):
-    #     render_pkg = self.forward_quantize()
-    #     image = render_pkg["render"]
-    #     loss = loss_fn(image, gt_image, self.loss_type, lambda_value=0.7) + render_pkg["vq_loss"]
-    #     loss.backward()
-    #     with torch.no_grad():
-    #         mse_loss = F.mse_loss(image, gt_image)
-    #         psnr = 10 * math.log10(1.0 / mse_loss.item())
-    #     self.optimizer.step()
-    #     self.optimizer.zero_grad(set_to_none=True)
-    #     self.scheduler.step()
-    #     return loss, psnr
-
-    # def compress_wo_ec(self):
-    #     means = torch.tanh(self.xyz_quantizer(self._xyz))
-    #     quant_cholesky_elements, cholesky_elements = self.cholesky_quantizer.compress(self._cholesky)
-    #     cholesky_elements = cholesky_elements + self.cholesky_bound
-    #     colors, feature_dc_index = self.features_dc_quantizer.compress(self.get_features)
-    #     return {"xyz":self._xyz.half(), "feature_dc_index": feature_dc_index, "quant_cholesky_elements": quant_cholesky_elements,}
-
-    # def decompress_wo_ec(self, encoding_dict):
-    #     xyz, feature_dc_index, quant_cholesky_elements = encoding_dict["xyz"], encoding_dict["feature_dc_index"], encoding_dict["quant_cholesky_elements"]
-    #     means = torch.tanh(xyz.float())
-    #     cholesky_elements = self.cholesky_quantizer.decompress(quant_cholesky_elements)
-    #     cholesky_elements = cholesky_elements + self.cholesky_bound
-    #     colors = self.features_dc_quantizer.decompress(feature_dc_index)
-    #     self.xys, depths, self.radii, conics, num_tiles_hit = project_gaussians_2d(means, cholesky_elements, self.H, self.W, self.tile_bounds)
-    #     out_img = rasterize_gaussians_sum(self.xys, depths, self.radii, conics, num_tiles_hit,
-    #             colors, self._opacity, self.H, self.W, self.BLOCK_H, self.BLOCK_W, background=self.background, return_alpha=False)
-    #     out_img = torch.clamp(out_img, 0, 1)
-    #     out_img = out_img.view(-1, self.H, self.W, 3).permute(0, 3, 1, 2).contiguous()
-    #     return {"render":out_img}
-
-    # def analysis_wo_ec(self, encoding_dict):
-    #     quant_cholesky_elements, feature_dc_index = encoding_dict["quant_cholesky_elements"], encoding_dict["feature_dc_index"]
-    #     total_bits = 0
-    #     initial_bits, codebook_bits = 0, 0
-    #     for quantizer_index, layer in enumerate(self.features_dc_quantizer.quantizer.layers):
-    #         codebook_bits += layer._codebook.embed.numel()*torch.finfo(layer._codebook.embed.dtype).bits
-    #     initial_bits += self.cholesky_quantizer.scale.numel()*torch.finfo(self.cholesky_quantizer.scale.dtype).bits
-    #     initial_bits += self.cholesky_quantizer.beta.numel()*torch.finfo(self.cholesky_quantizer.beta.dtype).bits
-    #     initial_bits += codebook_bits
-    #
-    #     total_bits += initial_bits
-    #     total_bits += self._xyz.numel()*16
-    #
-    #     feature_dc_index = feature_dc_index.int().cpu().numpy()
-    #     index_max = np.max(feature_dc_index)
-    #     max_bit = np.ceil(np.log2(index_max)) #calculate max bit for feature_dc_index
-    #     total_bits += feature_dc_index.size * max_bit #get_np_size(encoding_dict["feature_dc_index"]) * 8
-    #
-    #     quant_cholesky_elements = quant_cholesky_elements.cpu().numpy()
-    #     total_bits += quant_cholesky_elements.size * 6 #cholesky bits
-    #
-    #     position_bits = self._xyz.numel()*16
-    #     cholesky_bits, feature_dc_bits = 0, 0
-    #     cholesky_bits += self.cholesky_quantizer.scale.numel()*torch.finfo(self.cholesky_quantizer.scale.dtype).bits
-    #     cholesky_bits += self.cholesky_quantizer.beta.numel()*torch.finfo(self.cholesky_quantizer.beta.dtype).bits
-    #     cholesky_bits += quant_cholesky_elements.size * 6
-    #     feature_dc_bits += codebook_bits
-    #     feature_dc_bits += feature_dc_index.size * max_bit
-    #
-    #     bpp = total_bits/self.H/self.W
-    #     position_bpp = position_bits/self.H/self.W
-    #     cholesky_bpp = cholesky_bits/self.H/self.W
-    #     feature_dc_bpp = feature_dc_bits/self.H/self.W
-    #     return {"bpp": bpp, "position_bpp": position_bpp,
-    #         "cholesky_bpp": cholesky_bpp, "feature_dc_bpp": feature_dc_bpp}
-    #
-    # def compress(self):
-    #     means = torch.tanh(self.xyz_quantizer(self._xyz))
-    #     quant_cholesky_elements, cholesky_elements = self.cholesky_quantizer.compress(self._cholesky)
-    #     cholesky_elements = cholesky_elements + self.cholesky_bound
-    #     colors, feature_dc_index = self.features_dc_quantizer.compress(self.get_features)
-    #     cholesky_compressed, cholesky_histogram_table, cholesky_unique = compress_matrix_flatten_categorical(quant_cholesky_elements.int().flatten().tolist())
-    #     feature_dc_compressed, feature_dc_histogram_table, feature_dc_unique = compress_matrix_flatten_categorical(feature_dc_index.int().flatten().tolist())
-    #     return {"xyz":self._xyz.half(), "feature_dc_index": feature_dc_index, "quant_cholesky_elements": quant_cholesky_elements,
-    #         "feature_dc_bitstream":[feature_dc_compressed, feature_dc_histogram_table, feature_dc_unique],
-    #         "cholesky_bitstream":[cholesky_compressed, cholesky_histogram_table, cholesky_unique]}
-    #
-    # def decompress(self, encoding_dict):
-    #     xyz = encoding_dict["xyz"]
-    #     num_points, device = xyz.size(0), xyz.device
-    #     feature_dc_compressed, feature_dc_histogram_table, feature_dc_unique = encoding_dict["feature_dc_bitstream"]
-    #     cholesky_compressed, cholesky_histogram_table, cholesky_unique = encoding_dict["cholesky_bitstream"]
-    #     feature_dc_index = decompress_matrix_flatten_categorical(feature_dc_compressed, feature_dc_histogram_table, feature_dc_unique, num_points*2, (num_points, 2))
-    #     quant_cholesky_elements = decompress_matrix_flatten_categorical(cholesky_compressed, cholesky_histogram_table, cholesky_unique, num_points*3, (num_points, 3))
-    #     feature_dc_index = torch.from_numpy(feature_dc_index).to(device).int() #[800, 2]
-    #     quant_cholesky_elements = torch.from_numpy(quant_cholesky_elements).to(device).float() #[800, 3]
-    #
-    #     means = torch.tanh(xyz.float())
-    #     cholesky_elements = self.cholesky_quantizer.decompress(quant_cholesky_elements)
-    #     cholesky_elements = cholesky_elements + self.cholesky_bound
-    #     colors = self.features_dc_quantizer.decompress(feature_dc_index)
-    #     self.xys, depths, self.radii, conics, num_tiles_hit = project_gaussians_2d(means, cholesky_elements, self.H, self.W, self.tile_bounds)
-    #     out_img = rasterize_gaussians_sum(self.xys, depths, self.radii, conics, num_tiles_hit,
-    #             colors, self._opacity, self.H, self.W, self.BLOCK_H, self.BLOCK_W, background=self.background, return_alpha=False)
-    #     out_img = torch.clamp(out_img, 0, 1)
-    #     out_img = out_img.view(-1, self.H, self.W, 3).permute(0, 3, 1, 2).contiguous()
-    #     return {"render":out_img}
-    #
-    # def analysis(self, encoding_dict):
-    #     quant_cholesky_elements, feature_dc_index = encoding_dict["quant_cholesky_elements"], encoding_dict["feature_dc_index"]
-    #     cholesky_compressed, cholesky_histogram_table, cholesky_unique = compress_matrix_flatten_categorical(quant_cholesky_elements.int().flatten().tolist())
-    #     feature_dc_compressed, feature_dc_histogram_table, feature_dc_unique = compress_matrix_flatten_categorical(feature_dc_index.int().flatten().tolist())
-    #     cholesky_lookup = dict(zip(cholesky_unique, cholesky_histogram_table.astype(np.float64) / np.sum(cholesky_histogram_table).astype(np.float64)))
-    #     feature_dc_lookup = dict(zip(feature_dc_unique, feature_dc_histogram_table.astype(np.float64) / np.sum(feature_dc_histogram_table).astype(np.float64)))
-    #
-    #     total_bits = 0
-    #     initial_bits, codebook_bits = 0, 0
-    #     for quantizer_index, layer in enumerate(self.features_dc_quantizer.quantizer.layers):
-    #         codebook_bits += layer._codebook.embed.numel()*torch.finfo(layer._codebook.embed.dtype).bits
-    #     initial_bits += self.cholesky_quantizer.scale.numel()*torch.finfo(self.cholesky_quantizer.scale.dtype).bits
-    #     initial_bits += self.cholesky_quantizer.beta.numel()*torch.finfo(self.cholesky_quantizer.beta.dtype).bits
-    #     initial_bits += get_np_size(cholesky_histogram_table) * 8
-    #     initial_bits += get_np_size(cholesky_unique) * 8
-    #     initial_bits += get_np_size(feature_dc_histogram_table) * 8
-    #     initial_bits += get_np_size(feature_dc_unique) * 8
-    #     initial_bits += codebook_bits
-    #
-    #     total_bits += initial_bits
-    #     total_bits += self._xyz.numel()*16
-    #     total_bits += get_np_size(cholesky_compressed) * 8
-    #     total_bits += get_np_size(feature_dc_compressed) * 8
-    #
-    #     position_bits = self._xyz.numel()*16
-    #     cholesky_bits, feature_dc_bits = 0, 0
-    #     cholesky_bits += self.cholesky_quantizer.scale.numel()*torch.finfo(self.cholesky_quantizer.scale.dtype).bits
-    #     cholesky_bits += self.cholesky_quantizer.beta.numel()*torch.finfo(self.cholesky_quantizer.beta.dtype).bits
-    #     cholesky_bits += get_np_size(cholesky_histogram_table) * 8
-    #     cholesky_bits += get_np_size(cholesky_unique) * 8
-    #     cholesky_bits += get_np_size(cholesky_compressed) * 8
-    #     feature_dc_bits += codebook_bits
-    #     feature_dc_bits += get_np_size(feature_dc_histogram_table) * 8
-    #     feature_dc_bits += get_np_size(feature_dc_unique) * 8
-    #     feature_dc_bits += get_np_size(feature_dc_compressed) * 8
-    #
-    #     bpp = total_bits/self.H/self.W
-    #     position_bpp = position_bits/self.H/self.W
-    #     cholesky_bpp = cholesky_bits/self.H/self.W
-    #     feature_dc_bpp = feature_dc_bits/self.H/self.W
-    #     return {"bpp": bpp, "position_bpp": position_bpp,
-    #         "cholesky_bpp": cholesky_bpp, "feature_dc_bpp": feature_dc_bpp,}

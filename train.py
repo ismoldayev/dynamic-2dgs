@@ -24,6 +24,7 @@ from gaussianimage_cholesky import GaussianImage_Cholesky
 from optimizer import Adan # Make sure Adan is imported if used in re-init
 # Import cv2 for video writing
 import cv2
+from typing import Optional
 
 # Renamed Trainer class
 class VideoTrainer:
@@ -35,6 +36,7 @@ class VideoTrainer:
         num_points: int = 2000,
         iterations:int = 30000,
         model_path = None,
+        input_video_fps: Optional[float] = None,
         args = None,
     ):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -95,8 +97,17 @@ class VideoTrainer:
 
         self.logwriter = LogWriter(self.log_dir)
 
-        # Store output fps for video writing
-        self.output_fps = args.output_fps
+        # Determine output FPS for video writing
+        if args.output_fps is None: # User did not specify --output_fps
+            if input_video_fps is not None and input_video_fps > 0:
+                self.output_fps = input_video_fps
+                print(f"Using duration-preserving effective FPS ({self.output_fps:.2f}) for output video as --output_fps was not specified.")
+            else:
+                self.output_fps = 25.0 # Fallback if input_video_fps is also invalid
+                print(f"Warning: --output_fps not specified and could not determine valid input video FPS. Defaulting to {self.output_fps:.2f} FPS.")
+        else: # User explicitly provided --output_fps
+            self.output_fps = float(args.output_fps) # Ensure it's float
+            print(f"Using user-specified --output_fps ({self.output_fps:.2f}) for output video.")
 
         if model_path is not None:
             print(f"Loading model path: {model_path}")
@@ -471,7 +482,7 @@ def parse_args(argv):
     parser.add_argument("--model_path", type=str, default=None, help="Path to a checkpoint to load (optional)")
     parser.add_argument("--seed", type=int, default=42, help="Set random seed for reproducibility (default: %(default)s)")
     parser.add_argument("--save_frames", action=argparse.BooleanOptionalAction, default=True, help="Save rendered frames during evaluation (default: %(default)s)")
-    parser.add_argument("--output_fps", type=int, default=25, help="FPS for the output video if saving is enabled (default: %(default)s)")
+    parser.add_argument("--output_fps", type=float, default=None, help="FPS for the output video. If not specified, an effective FPS is calculated to preserve original video duration based on sampled frames. (default: %(default)s)")
     parser.add_argument("--lambda_neighbor_rigidity", type=float, default=0.0, help="Strength of neighbor rigidity loss (maintaining inter-Gaussian distances) (default: %(default)s)")
     parser.add_argument("--k_neighbors", type=int, default=5, help="Number of neighbors for rigidity loss (default: %(default)s)")
     # Densification arguments
@@ -485,7 +496,6 @@ def parse_args(argv):
     parser.add_argument("--lr_final", type=float, default=1e-05, help="Final learning rate for cosine decay (default: %(default)s)")
     parser.add_argument("--lr_delay_mult", type=float, default=0.1, help="Learning rate delay multiplier (default: %(default)s)") # From 3DGS
     parser.add_argument("--lr_delay_steps", type=int, default=0, help="Learning rate delay steps (default: %(default)s)") # From 3DGS
-    parser.add_argument("--output_video_fps", type=float, default=25.0, help="FPS for the output rendered video (default: %(default)s)")
     parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay rate for temporal regularization")
     parser.add_argument("--polynomial_degree", type=int, default=7, help="Degree of the polynomial for time representation (XYZ, Cholesky) (default: %(default)s)")
     parser.add_argument("--opacity_polynomial_degree", type=int, default=None, help="Degree of the polynomial for opacity time representation. If None, uses polynomial_degree. (default: %(default)s)")
@@ -502,6 +512,15 @@ def parse_args(argv):
     # parser.add_argument("--images", type=str, default="images", help="Path to training images folder (default: %(default)s)")
 
     args = parser.parse_args(argv)
+
+    # Rename output_video_fps to output_fps if it exists from old args and output_fps is not set
+    if hasattr(args, 'output_video_fps') and args.output_video_fps is not None and args.output_fps is None:
+        print("Warning: --output_video_fps is deprecated. Using its value for --output_fps.")
+        args.output_fps = args.output_video_fps
+    # Remove the old attribute to avoid confusion if it was present
+    if hasattr(args, 'output_video_fps'):
+        delattr(args, 'output_video_fps')
+
     return args
 
 def main(argv):
@@ -530,7 +549,7 @@ def main(argv):
         # Load video frames using the utility function
         # Load a specific number of evenly spaced frames based on args.num_frames
         print(f"Loading {args.num_frames if args.num_frames > 0 else 'all'} evenly spaced frames from video for training and evaluation...")
-        gt_frames_tensor = video_path_to_tensor(video_path, num_frames=args.num_frames if args.num_frames > 0 else None)
+        gt_frames_tensor, input_video_fps = video_path_to_tensor(video_path, num_frames=args.num_frames if args.num_frames > 0 else None)
 
     except Exception as e:
         print(f"Error loading video: {e}")
@@ -544,7 +563,8 @@ def main(argv):
         num_points=args.num_points,
         iterations=args.iterations,
         args=args,
-        model_path=args.model_path
+        model_path=args.model_path,
+        input_video_fps=input_video_fps
     )
 
     # Save args to log dir

@@ -276,7 +276,19 @@ def video_path_to_tensor(video_path, num_frames=None, target_size=None):
     # Stack frames into a single tensor (T, C, H, W)
     video_tensor = torch.stack(frames)
     print(f"Final video tensor shape: {video_tensor.shape}") # Should match frames_to_capture
-    return video_tensor
+
+    # Calculate effective output FPS for duration preservation
+    effective_output_fps = 25.0 # Default fallback
+    if total_frames > 0 and frames_to_capture > 0 and video_fps is not None and video_fps > 0:
+        effective_output_fps = video_fps * (frames_to_capture / total_frames)
+        print(f"Calculated effective output FPS for duration preservation: {effective_output_fps:.2f} (Original FPS: {video_fps:.2f}, Frames Captured: {frames_to_capture}, Total Original: {total_frames})")
+    elif video_fps is not None and video_fps > 0:
+        effective_output_fps = video_fps # Fallback to original FPS if frame counts are problematic for ratio
+        print(f"Warning: Using original video FPS ({video_fps:.2f}) as effective FPS could not be calculated reliably due to frame counts.")
+    else:
+        print(f"Warning: Could not determine valid original video FPS. Using default effective FPS: {effective_output_fps:.2f} FPS.")
+
+    return video_tensor, effective_output_fps
 
 def get_video_properties_ffprobe(video_path):
     """Uses ffprobe to get rotation and accurate frame count from a video file.
