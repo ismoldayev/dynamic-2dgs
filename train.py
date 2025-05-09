@@ -508,6 +508,10 @@ def parse_args(argv):
     # New arguments for initialization
     parser.add_argument("--initialization_logit_eps", type=float, default=1e-6, help="Epsilon for logit calculation during initialization (default: %(default)s)")
 
+    # Arguments for trajectory modeling
+    parser.add_argument("--trajectory_model_type", type=str, default="polynomial", choices=["polynomial", "bspline"], help="Type of model for trajectories (xyz, cholesky) (default: %(default)s)")
+    parser.add_argument("--num_control_points", type=int, default=5, help="Number of control points K if trajectory_model_type is bspline (default: %(default)s)")
+
     # Remove old/unused arguments
     # parser.add_argument("--images", type=str, default="images", help="Path to training images folder (default: %(default)s)")
 

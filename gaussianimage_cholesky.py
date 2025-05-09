@@ -68,7 +68,12 @@ class EMA:
         return self.shadow_params
 
 class GaussianImage_Cholesky(nn.Module):
-    def __init__(self, loss_type="L2", T=1, lambda_neighbor_rigidity=0.0, k_neighbors=5, ema_decay=0.999, polynomial_degree=1, lambda_xyz_coeffs_reg=0.0, lambda_cholesky_coeffs_reg=0.0, lambda_opacity_coeffs_reg=0.0, opacity_polynomial_degree=None, gt_frames_for_init: Optional[torch.Tensor] = None, initialization_logit_eps: float = 1e-6, **kwargs):
+    def __init__(self, loss_type="L2", T=1, lambda_neighbor_rigidity=0.0, k_neighbors=5, ema_decay=0.999,
+                 polynomial_degree=1, lambda_xyz_coeffs_reg=0.0, lambda_cholesky_coeffs_reg=0.0,
+                 lambda_opacity_coeffs_reg=0.0, opacity_polynomial_degree=None,
+                 gt_frames_for_init: Optional[torch.Tensor] = None, initialization_logit_eps: float = 1e-6,
+                 trajectory_model_type: str = "polynomial", num_control_points: int = 5,
+                 **kwargs):
         super().__init__()
         self.loss_type = loss_type
         self.num_points = kwargs["num_points"]
@@ -87,11 +92,12 @@ class GaussianImage_Cholesky(nn.Module):
         )
         self.device = kwargs["device"]
 
-        self.polynomial_degree = polynomial_degree # Use passed-in degree
-        self.opacity_polynomial_degree = opacity_polynomial_degree if opacity_polynomial_degree is not None else polynomial_degree
+        self.trajectory_model_type = trajectory_model_type
+        self.polynomial_degree = polynomial_degree
+        self.K_control_points = num_control_points
+        self.bspline_degree = 3 # Fixed cubic B-splines for now
 
-        num_coeffs_xyz_chol = self.polynomial_degree + 1
-        num_coeffs_opacity = self.opacity_polynomial_degree + 1
+        self.opacity_polynomial_degree = opacity_polynomial_degree if opacity_polynomial_degree is not None else polynomial_degree
 
         # Time values for polynomial evaluation, normalized from 0 to 1
         if self.T > 0:
@@ -108,7 +114,7 @@ class GaussianImage_Cholesky(nn.Module):
                     t_power_matrix_list.append(self.t_values.pow(i).unsqueeze(1))
             t_power_matrix = torch.cat(t_power_matrix_list, dim=1)
         else:
-            t_power_matrix = torch.empty(0, num_coeffs_xyz_chol, device=self.device)
+            t_power_matrix = torch.empty(0, self.polynomial_degree + 1, device=self.device)
         self.register_buffer('t_power_matrix', t_power_matrix, persistent=False)
 
         # Create t_power_matrix for opacity if its degree is different
@@ -122,30 +128,49 @@ class GaussianImage_Cholesky(nn.Module):
                         t_power_matrix_opacity_list.append(self.t_values.pow(i).unsqueeze(1))
                 t_power_matrix_opacity = torch.cat(t_power_matrix_opacity_list, dim=1)
             else:
-                t_power_matrix_opacity = torch.empty(0, num_coeffs_opacity, device=self.device)
+                t_power_matrix_opacity = torch.empty(0, self.opacity_polynomial_degree + 1, device=self.device)
             self.register_buffer('t_power_matrix_opacity', t_power_matrix_opacity, persistent=False)
 
         self.opacity_activation = torch.sigmoid
         self.rgb_activation = torch.sigmoid
 
-        # Initialize _xyz_coeffs: (num_coeffs_xyz_chol, N, 2)
-        # c0 (constant term) is random
-        initial_xyz_c0 = torch.atanh(2 * (torch.rand(self.num_points, 2, device=self.device) - 0.5))
-        # c1...cD (higher order terms) are zero for constant initialization
-        higher_order_xyz_coeffs = torch.zeros(self.polynomial_degree, self.num_points, 2, device=self.device)
-        self._xyz_coeffs = nn.Parameter(torch.cat([initial_xyz_c0.unsqueeze(0), higher_order_xyz_coeffs], dim=0))
+        # Initialize trajectory parameters based on model type
+        if self.trajectory_model_type == "polynomial":
+            print(f"Using POLYNOMIAL model for XYZ/Cholesky trajectories with degree {self.polynomial_degree}.")
+            # Initialize _xyz_coeffs: (polynomial_degree + 1, N, 2)
+            initial_xyz_c0 = torch.atanh(2 * (torch.rand(self.num_points, 2, device=self.device) - 0.5))
+            higher_order_xyz_coeffs = torch.zeros(self.polynomial_degree, self.num_points, 2, device=self.device)
+            self._xyz_coeffs = nn.Parameter(torch.cat([initial_xyz_c0.unsqueeze(0), higher_order_xyz_coeffs], dim=0))
 
+            # Initialize _cholesky_coeffs: (polynomial_degree + 1, N, 3)
+            init_chol_base_c0_poly = torch.tensor([1.0, 0.0, 1.0], device=self.device).view(1, 3)
+            noise_per_gaussian_c0_poly = torch.randn(self.num_points, 3, device=self.device) * 0.01
+            initial_cholesky_c0_poly = init_chol_base_c0_poly.repeat(self.num_points, 1) + noise_per_gaussian_c0_poly
+            higher_order_cholesky_coeffs = torch.zeros(self.polynomial_degree, self.num_points, 3, device=self.device)
+            self._cholesky_coeffs = nn.Parameter(torch.cat([initial_cholesky_c0_poly.unsqueeze(0), higher_order_cholesky_coeffs], dim=0))
 
-        # Initialize _cholesky_coeffs: (num_coeffs_xyz_chol, N, 3)
-        # c0 (constant term) is random (near identity)
-        init_chol_base_c0 = torch.tensor([1.0, 0.0, 1.0], device=self.device).view(1, 3)
-        noise_per_gaussian_c0 = torch.randn(self.num_points, 3, device=self.device) * 0.01
-        initial_cholesky_c0 = init_chol_base_c0.repeat(self.num_points, 1) + noise_per_gaussian_c0
-        # c1...cD (higher order terms) are zero
-        higher_order_cholesky_coeffs = torch.zeros(self.polynomial_degree, self.num_points, 3, device=self.device)
-        self._cholesky_coeffs = nn.Parameter(torch.cat([initial_cholesky_c0.unsqueeze(0), higher_order_cholesky_coeffs], dim=0))
+            self._initial_xyz_for_custom_init = initial_xyz_c0.clone().detach()
 
-        # Initialize _opacity_coeffs: (num_coeffs_opacity, N, 1)
+        elif self.trajectory_model_type == "bspline":
+            if self.K_control_points <= self.bspline_degree:
+                raise ValueError(f"Number of control points K ({self.K_control_points}) must be greater than B-spline degree p ({self.bspline_degree}).")
+            print(f"Using B-SPLINE model for XYZ/Cholesky trajectories with K={self.K_control_points} control points and degree {self.bspline_degree}.")
+
+            # Base initial values (static state for all K control points)
+            initial_xyz_base_spline = torch.atanh(2 * (torch.rand(self.num_points, 2, device=self.device) - 0.5))
+
+            _init_chol_c0_part1_spline = torch.tensor([1.0, 0.0, 1.0], device=self.device).view(1, 3).repeat(self.num_points, 1)
+            _init_chol_c0_part2_spline = torch.randn(self.num_points, 3, device=self.device) * 0.01
+            initial_cholesky_base_spline = _init_chol_c0_part1_spline + _init_chol_c0_part2_spline
+
+            self._xyz_control_points = nn.Parameter(initial_xyz_base_spline.unsqueeze(1).repeat(1, self.K_control_points, 1))
+            self._cholesky_control_points = nn.Parameter(initial_cholesky_base_spline.unsqueeze(1).repeat(1, self.K_control_points, 1))
+
+            self._initial_xyz_for_custom_init = initial_xyz_base_spline.clone().detach()
+        else:
+            raise ValueError(f"Unknown trajectory_model_type: {self.trajectory_model_type}")
+
+        # Initialize _opacity_coeffs: (num_coeffs_opacity, N, 1) - always polynomial for now
         # c0 (constant term) initialized to give opacity of 0.5 initially (logit(0.5)=0)
         initial_opacity_c0 = torch.zeros(self.num_points, 1, device=self.device)
         # c1...cD (higher order terms) are zero
@@ -163,8 +188,7 @@ class GaussianImage_Cholesky(nn.Module):
 
             print(f"Using ground truth frames for Gaussian color and (cosine similarity based) opacity initialization with eps {initialization_logit_eps:.1e}.")
 
-            # Detach initial_xyz_c0 from computation graph for this part as it's an input to init
-            initial_xyz_c0_detached = self._xyz_coeffs[0].clone().detach() # Shape (N, 2)
+            initial_xyz_c0_detached = self._initial_xyz_for_custom_init # Shape (N, 2)
 
             # Compute pixel coordinates for all Gaussians simultaneously
             xy_normalized = torch.tanh(initial_xyz_c0_detached) # Values in [-1, 1)
@@ -328,11 +352,19 @@ class GaussianImage_Cholesky(nn.Module):
         self.ema_cholesky = None
         self.ema_decay = ema_decay # Store decay rate
 
-        if self.lambda_xyz_coeffs_reg > 0:
-            self.ema_xyz = EMA([self._xyz_coeffs], decay=self.ema_decay) # Track coefficients
+        if self.lambda_xyz_coeffs_reg > 0: # This lambda is for polynomial coefficient regularization
+            if self.trajectory_model_type == "polynomial":
+                self.ema_xyz = EMA([self._xyz_coeffs], decay=self.ema_decay)
+            elif self.trajectory_model_type == "bspline":
+                # For B-splines, lambda_xyz_coeffs_reg might be repurposed for control point smoothness later
+                # For now, if a reg is on, EMA tracks control points.
+                self.ema_xyz = EMA([self._xyz_control_points], decay=self.ema_decay)
 
-        if self.lambda_cholesky_coeffs_reg > 0:
-            self.ema_cholesky = EMA([self._cholesky_coeffs], decay=self.ema_decay) # Track coefficients
+        if self.lambda_cholesky_coeffs_reg > 0: # This lambda is for polynomial coefficient regularization
+            if self.trajectory_model_type == "polynomial":
+                self.ema_cholesky = EMA([self._cholesky_coeffs], decay=self.ema_decay)
+            elif self.trajectory_model_type == "bspline":
+                self.ema_cholesky = EMA([self._cholesky_control_points], decay=self.ema_decay)
 
         if kwargs["opt_type"] == "adam":
             self.optimizer = torch.optim.Adam(self.parameters(), lr=kwargs["lr"])
