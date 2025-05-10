@@ -135,15 +135,16 @@ def build_triangular(r):
     R[:, 1, 1] = r[:, 2]
     return R
 
-def video_path_to_tensor(video_path, num_frames=None, target_size=None):
+def video_path_to_tensor(video_path, num_frames=None, target_size=None, target_pixel_count=65536):
     """Reads frames from a video file, resizes them, and returns a tensor.
 
     Args:
         video_path (str): Path to the video file.
         num_frames (int, optional): Number of frames to read. Reads all if None.
         target_size (tuple, optional): Target size (width, height). If None,
-                                     resizes based on a heuristic similar to
-                                     the original image processing.
+                                     resizes based on target_pixel_count.
+        target_pixel_count (int, optional): Target number of pixels for resizing.
+                                          Default is 65536 (256x256).
 
     Returns:
         torch.Tensor: Tensor containing video frames of shape (T, C, H, W).
@@ -237,8 +238,7 @@ def video_path_to_tensor(video_path, num_frames=None, target_size=None):
                 original_w, original_h = img.size
                 print(f"Original Frame size: ({original_w}, {original_h})")
                 if target_size is None:
-                    # Heuristic resizing to aim for roughly 256*256 pixels
-                    target_pixel_count = 256 * 256
+                    # Heuristic resizing to aim for target_pixel_count pixels
                     if original_w * original_h > 0: # Check to avoid division by zero
                         if original_w * original_h > target_pixel_count:
                             # Only scale down if the original is larger than the target
