@@ -131,12 +131,7 @@ class GaussianImage_Cholesky(nn.Module):
                 t_power_matrix_opacity = torch.empty(0, self.opacity_polynomial_degree + 1, device=self.device)
             self.register_buffer('t_power_matrix_opacity', t_power_matrix_opacity, persistent=False)
 
-        # Custom opacity activation that maps sigmoid output to [0.9,1] range
-        def custom_opacity_activation(x):
-            sigmoid_out = torch.sigmoid(x)
-            return 0.9 + 0.1 * sigmoid_out  # Maps [0,1] to [0.9,1]
-
-        self.opacity_activation = custom_opacity_activation
+        self.opacity_activation = torch.sigmoid
         self.rgb_activation = torch.sigmoid
 
         # Initialize trajectory parameters based on model type
@@ -183,6 +178,7 @@ class GaussianImage_Cholesky(nn.Module):
         self._opacity_coeffs = nn.Parameter(torch.cat([initial_opacity_c0.unsqueeze(0), higher_order_opacity_coeffs], dim=0))
 
         # Static parameters: features_dc are still static for now
+        # self._opacity = nn.Parameter(torch.ones((self.num_points, 1), device=self.device))) # Old static opacity
         self._features_dc = nn.Parameter(torch.randn(self.num_points, 3, device=self.device))
 
         # --- New Initialization Logic for Color and Opacity ---
@@ -230,15 +226,125 @@ class GaussianImage_Cholesky(nn.Module):
 
             print("Finished custom initialization of color and opacity.")
 
+            # --- BEGIN INITIAL ANALYSIS AFTER CUSTOM INIT ---
+            with torch.no_grad():
+                # Color Analysis
+                raw_color_logits_init = self._features_dc.detach().cpu().numpy()
+                # Directly compute activated colors to avoid property lookup issue during __init__
+                activated_colors_init_tensor = self.rgb_activation(self._features_dc)
+                final_colors_init = activated_colors_init_tensor.detach().cpu().numpy()
+                print(f"\n--- Color Feature Analysis (After Custom Initialization) ---")
+                if raw_color_logits_init.size > 0:
+                    print("Raw Color Logits (_features_dc):")
+                    print(f"  Shape: {raw_color_logits_init.shape}")
+                    print(f"  Min: {np.min(raw_color_logits_init):.4f}, Max: {np.max(raw_color_logits_init):.4f}, Mean: {np.mean(raw_color_logits_init):.4f}, Median: {np.median(raw_color_logits_init):.4f}")
+                    print("Final Colors (after sigmoid):")
+                    print(f"  Shape: {final_colors_init.shape}")
+                    print(f"  Min: {np.min(final_colors_init):.4f}, Max: {np.max(final_colors_init):.4f}, Mean: {np.mean(final_colors_init):.4f}, Median: {np.median(final_colors_init):.4f}")
+                    for i_chan in range(final_colors_init.shape[1]):
+                        print(f"  Channel {i_chan} (RGB) - Min: {np.min(final_colors_init[:, i_chan]):.4f}, Max: {np.max(final_colors_init[:, i_chan]):.4f}, Mean: {np.mean(final_colors_init[:, i_chan]):.4f}")
+                else:
+                    print("No color features to analyze (num_points might be 0).")
+                print("--- End Initial Color Feature Analysis ---")
+
+                # Opacity Analysis
+                if self.num_points > 0:
+                    opacity_c0_logits_init_np = self._opacity_coeffs[0].detach().cpu().numpy().flatten()
+                    opacity_c0_sigmoid_init_np = torch.sigmoid(self._opacity_coeffs[0].detach().cpu()).numpy().flatten()
+                    all_opacities_tensor_init = self.get_opacity.detach().cpu()
+                    all_opacities_init_np = all_opacities_tensor_init.numpy().flatten()
+
+                    print(f"\n--- Opacity Distribution Analysis (After Custom Initialization) ---")
+                    if opacity_c0_logits_init_np.size > 0:
+                        print("Initial Opacity C0 Logits (_opacity_coeffs[0]):")
+                        print(f"  Shape: {opacity_c0_logits_init_np.shape}")
+                        print(f"  Min: {np.min(opacity_c0_logits_init_np):.4f}, Max: {np.max(opacity_c0_logits_init_np):.4f}, Mean: {np.mean(opacity_c0_logits_init_np):.4f}, Median: {np.median(opacity_c0_logits_init_np):.4f}")
+                        print("Initial Opacity C0 Sigmoid (_opacity_coeffs[0] after sigmoid):")
+                        print(f"  Shape: {opacity_c0_sigmoid_init_np.shape}")
+                        print(f"  Min: {np.min(opacity_c0_sigmoid_init_np):.4f}, Max: {np.max(opacity_c0_sigmoid_init_np):.4f}, Mean: {np.mean(opacity_c0_sigmoid_init_np):.4f}, Median: {np.median(opacity_c0_sigmoid_init_np):.4f}")
+
+                    if all_opacities_init_np.size > 0:
+                        print("Full Opacity Tensor (self.get_opacity, potentially time-varying):")
+                        print(f"  Opacities Tensor Shape (T, N, 1): {all_opacities_tensor_init.shape}")
+                        print(f"  Total Opacity Values Analyzed: {all_opacities_init_np.size}")
+                        print(f"  Min Opacity: {np.min(all_opacities_init_np):.4f}, Max Opacity: {np.max(all_opacities_init_np):.4f}, Mean Opacity: {np.mean(all_opacities_init_np):.4f}, Median Opacity: {np.median(all_opacities_init_np):.4f}")
+                        percentiles_opac = [10, 25, 50, 75, 90]
+                        perc_values_opac = np.percentile(all_opacities_init_np, percentiles_opac)
+                        for p_perc, v_perc in zip(percentiles_opac, perc_values_opac):
+                            print(f"  {p_perc}th Percentile: {v_perc:.4f}")
+                    else:
+                        print("  No full opacity tensor values to analyze.")
+                else:
+                    print("Skipping initial opacity distribution analysis: No Gaussians.")
+                print("--- End Initial Opacity Distribution Analysis ---")
+            # --- END INITIAL ANALYSIS AFTER CUSTOM INIT ---
+
         else:
             if gt_frames_for_init is not None:
                 print("Warning: Skipping custom Gaussian initialization. Conditions not met (e.g., no points, T=0, or frame shape mismatch).")
             # If not using custom init, _features_dc keeps its randn init, and _opacity_coeffs keeps its zeros init for c0.
             print("Using default (random/zero) initialization for color and opacity.")
 
+            # --- BEGIN INITIAL ANALYSIS AFTER DEFAULT INIT ---
+            with torch.no_grad():
+                # Color Analysis
+                raw_color_logits_default = self._features_dc.detach().cpu().numpy()
+                # Directly compute activated colors to avoid property lookup issue during __init__
+                activated_colors_default_tensor = self.rgb_activation(self._features_dc)
+                final_colors_default = activated_colors_default_tensor.detach().cpu().numpy()
+                print(f"\n--- Color Feature Analysis (Default Initial State) ---")
+                if raw_color_logits_default.size > 0:
+                    print("Raw Color Logits (_features_dc):")
+                    print(f"  Shape: {raw_color_logits_default.shape}")
+                    print(f"  Min: {np.min(raw_color_logits_default):.4f}, Max: {np.max(raw_color_logits_default):.4f}, Mean: {np.mean(raw_color_logits_default):.4f}, Median: {np.median(raw_color_logits_default):.4f}")
+                    print("Final Colors (after sigmoid):")
+                    print(f"  Shape: {final_colors_default.shape}")
+                    print(f"  Min: {np.min(final_colors_default):.4f}, Max: {np.max(final_colors_default):.4f}, Mean: {np.mean(final_colors_default):.4f}, Median: {np.median(final_colors_default):.4f}")
+                    for i_chan in range(final_colors_default.shape[1]):
+                        print(f"  Channel {i_chan} (RGB) - Min: {np.min(final_colors_default[:, i_chan]):.4f}, Max: {np.max(final_colors_default[:, i_chan]):.4f}, Mean: {np.mean(final_colors_default[:, i_chan]):.4f}")
+                else:
+                    print("No color features to analyze (num_points might be 0).")
+                print("--- End Default Initial Color Feature Analysis ---")
+
+                # Opacity Analysis
+                if self.num_points > 0:
+                    opacity_c0_logits_default_np = self._opacity_coeffs[0].detach().cpu().numpy().flatten()
+                    opacity_c0_sigmoid_default_np = torch.sigmoid(self._opacity_coeffs[0].detach().cpu()).numpy().flatten()
+                    all_opacities_tensor_default = self.get_opacity.detach().cpu()
+                    all_opacities_default_np = all_opacities_tensor_default.numpy().flatten()
+
+                    print(f"\n--- Opacity Distribution Analysis (Default Initial State) ---")
+                    if opacity_c0_logits_default_np.size > 0:
+                        print("Initial Opacity C0 Logits (_opacity_coeffs[0]):")
+                        print(f"  Shape: {opacity_c0_logits_default_np.shape}")
+                        print(f"  Min: {np.min(opacity_c0_logits_default_np):.4f}, Max: {np.max(opacity_c0_logits_default_np):.4f}, Mean: {np.mean(opacity_c0_logits_default_np):.4f}, Median: {np.median(opacity_c0_logits_default_np):.4f}")
+                        print("Initial Opacity C0 Sigmoid (_opacity_coeffs[0] after sigmoid):")
+                        print(f"  Shape: {opacity_c0_sigmoid_default_np.shape}")
+                        print(f"  Min: {np.min(opacity_c0_sigmoid_default_np):.4f}, Max: {np.max(opacity_c0_sigmoid_default_np):.4f}, Mean: {np.mean(opacity_c0_sigmoid_default_np):.4f}, Median: {np.median(opacity_c0_sigmoid_default_np):.4f}")
+
+                    if all_opacities_default_np.size > 0:
+                        print("Full Opacity Tensor (self.get_opacity, potentially time-varying):")
+                        print(f"  Opacities Tensor Shape (T, N, 1): {all_opacities_tensor_default.shape}")
+                        print(f"  Total Opacity Values Analyzed: {all_opacities_default_np.size}")
+                        print(f"  Min Opacity: {np.min(all_opacities_default_np):.4f}, Max Opacity: {np.max(all_opacities_default_np):.4f}, Mean Opacity: {np.mean(all_opacities_default_np):.4f}, Median Opacity: {np.median(all_opacities_default_np):.4f}")
+                        percentiles_opac_def = [10, 25, 50, 75, 90]
+                        perc_values_opac_def = np.percentile(all_opacities_default_np, percentiles_opac_def)
+                        for p_perc, v_perc in zip(percentiles_opac_def, perc_values_opac_def):
+                            print(f"  {p_perc}th Percentile: {v_perc:.4f}")
+                    else:
+                        print("  No full opacity tensor values to analyze.")
+                else:
+                    print("Skipping default initial opacity distribution analysis: No Gaussians.")
+                print("--- End Default Initial Opacity Distribution Analysis ---")
+            # --- END INITIAL ANALYSIS AFTER DEFAULT INIT ---
+
         # --- End New Initialization Logic ---
 
         self.last_size = (self.H, self.W)
+        # self.register_buffer('background', torch.rand(3, device=self.device)) # Removed: background will be handled in forward
+        # self.opacity_activation = torch.sigmoid
+        # self.rgb_activation = torch.sigmoid
+        # self.register_buffer('bound', torch.tensor([0.5, 0.5]).view(1, 2).to(self.device)) # Not used?
         self.register_buffer('cholesky_bound', torch.tensor([0.5, 0, 0.5]).view(1, 1, 3).to(self.device)) # Adjusted shape for broadcasting
 
         # Initialize EMA objects - will be None if lambda is 0
@@ -268,30 +374,31 @@ class GaussianImage_Cholesky(nn.Module):
 
         # Initialize neighbor information for rigidity loss
         if self.lambda_neighbor_rigidity > 0 and self.num_points > self.k_neighbors and self.T > 1 and self.k_neighbors > 0:
-            self._initialize_neighbors()
+            with torch.no_grad(): # Operations here should not be part of the computation graph for _xyz init
+                # Detach explicitly if get_xyz involves operations on parameters being optimized
+                xyz_t0 = self.get_xyz[0].clone().detach() # Shape (N, 2)
 
-    def _initialize_neighbors(self):
-        """Initialize neighbor information for rigidity loss."""
-        with torch.no_grad():
-            # Get initial positions from the first frame
-            if self.trajectory_model_type == "polynomial":
-                xyz_t0 = torch.tanh(self._xyz_coeffs[0])  # Shape (N, 2)
-            else:  # bspline
-                xyz_t0 = torch.tanh(self._xyz_control_points[:, 0])  # Shape (N, 2)
+                # Pairwise squared Euclidean distances
+                # cdist computes L2 norm (Euclidean distance), then we square it for consistency with some formulations
+                # However, working with direct distances (sqrt) is fine and perhaps more intuitive.
+                pairwise_distances = torch.cdist(xyz_t0, xyz_t0, p=2.0) # Shape (N, N)
+                pairwise_distances.fill_diagonal_(float('inf')) # Ignore distance to self
 
-            # Pairwise squared Euclidean distances
-            pairwise_distances = torch.cdist(xyz_t0, xyz_t0, p=2.0)  # Shape (N, N)
-            pairwise_distances.fill_diagonal_(float('inf'))  # Ignore distance to self
-
-            initial_neighbor_distances, neighbor_indices = torch.topk(
-                pairwise_distances, self.k_neighbors, dim=1, largest=False
-            )
-            self.register_buffer('initial_neighbor_distances', initial_neighbor_distances, persistent=False)
-            self.register_buffer('neighbor_indices', neighbor_indices, persistent=False)
+                initial_neighbor_distances, neighbor_indices = torch.topk(
+                    pairwise_distances, self.k_neighbors, dim=1, largest=False
+                )
+                self.register_buffer('initial_neighbor_distances', initial_neighbor_distances, persistent=False)
+                self.register_buffer('neighbor_indices', neighbor_indices, persistent=False)
+                # print(f"Initialized neighbor rigidity buffers. Shapes: D={self.initial_neighbor_distances.shape}, I={self.neighbor_indices.shape}")
+        else:
+            if self.lambda_neighbor_rigidity > 0:
+                print("Warning: Neighbor rigidity loss not initialized due to insufficient points, T<=1, or k_neighbors<=0.")
 
     def _get_evaluated_polynomials(self, t_values_for_eval: torch.Tensor):
         """Helper to evaluate all time-varying polynomials for a given set of t_values."""
         if t_values_for_eval.numel() == 0:
+            num_coeffs_xyz_chol = self.polynomial_degree + 1
+            num_coeffs_opacity = self.opacity_polynomial_degree + 1
             # Return empty tensors with correct trailing dimensions
             return (
                 torch.empty(0, self.num_points, 2, device=self.device),
@@ -299,65 +406,35 @@ class GaussianImage_Cholesky(nn.Module):
                 torch.empty(0, self.num_points, 1, device=self.device)
             )
 
-        if self.trajectory_model_type == "polynomial":
-            # Evaluate t_power_matrix for XYZ and Cholesky
-            t_power_matrix_eval_list_xyz_chol = [torch.ones_like(t_values_for_eval).unsqueeze(1)] # t^0
-            if self.polynomial_degree > 0:
-                for i in range(1, self.polynomial_degree + 1):
-                    t_power_matrix_eval_list_xyz_chol.append(t_values_for_eval.pow(i).unsqueeze(1))
-            t_power_matrix_eval_xyz_chol = torch.cat(t_power_matrix_eval_list_xyz_chol, dim=1)
+        # Evaluate t_power_matrix for XYZ and Cholesky
+        t_power_matrix_eval_list_xyz_chol = [torch.ones_like(t_values_for_eval).unsqueeze(1)] # t^0
+        if self.polynomial_degree > 0:
+            for i in range(1, self.polynomial_degree + 1):
+                t_power_matrix_eval_list_xyz_chol.append(t_values_for_eval.pow(i).unsqueeze(1))
+        t_power_matrix_eval_xyz_chol = torch.cat(t_power_matrix_eval_list_xyz_chol, dim=1)
 
-            # Evaluate t_power_matrix for Opacity
-            if self.polynomial_degree == self.opacity_polynomial_degree:
-                t_power_matrix_eval_opacity = t_power_matrix_eval_xyz_chol
-            else:
-                t_power_matrix_eval_list_opacity = [torch.ones_like(t_values_for_eval).unsqueeze(1)] # t^0
-                if self.opacity_polynomial_degree > 0:
-                    for i in range(1, self.opacity_polynomial_degree + 1):
-                        t_power_matrix_eval_list_opacity.append(t_values_for_eval.pow(i).unsqueeze(1))
-                t_power_matrix_eval_opacity = torch.cat(t_power_matrix_eval_list_opacity, dim=1)
+        # Evaluate t_power_matrix for Opacity
+        if self.polynomial_degree == self.opacity_polynomial_degree:
+            t_power_matrix_eval_opacity = t_power_matrix_eval_xyz_chol
+        else:
+            t_power_matrix_eval_list_opacity = [torch.ones_like(t_values_for_eval).unsqueeze(1)] # t^0
+            if self.opacity_polynomial_degree > 0:
+                for i in range(1, self.opacity_polynomial_degree + 1):
+                    t_power_matrix_eval_list_opacity.append(t_values_for_eval.pow(i).unsqueeze(1))
+            t_power_matrix_eval_opacity = torch.cat(t_power_matrix_eval_list_opacity, dim=1)
 
-            # xyz: (num_coeffs, N, 2) @ (T_eval, num_coeffs)^T -> (N, 2, T_eval) -> (T_eval, N, 2)
-            evaluated_xyz_logits = torch.einsum('dnp,td->tnp', self._xyz_coeffs, t_power_matrix_eval_xyz_chol)
-            evaluated_xyz = torch.tanh(evaluated_xyz_logits)
 
-            # cholesky: (num_coeffs, N, 3) @ (T_eval, num_coeffs)^T -> (N, 3, T_eval) -> (T_eval, N, 3)
-            evaluated_cholesky_raw = torch.einsum('dnp,td->tnp', self._cholesky_coeffs, t_power_matrix_eval_xyz_chol)
-            evaluated_cholesky = evaluated_cholesky_raw + self.cholesky_bound
+        # xyz: (num_coeffs, N, 2) @ (T_eval, num_coeffs)^T -> (N, 2, T_eval) -> (T_eval, N, 2)
+        evaluated_xyz_logits = torch.einsum('dnp,td->tnp', self._xyz_coeffs, t_power_matrix_eval_xyz_chol)
+        evaluated_xyz = torch.tanh(evaluated_xyz_logits)
 
-            # opacity: (num_coeffs, N, 1) @ (T_eval, num_coeffs)^T -> (N, 1, T_eval) -> (T_eval, N, 1)
-            evaluated_opacity_logits = torch.einsum('dnp,td->tnp', self._opacity_coeffs, t_power_matrix_eval_opacity)
-            evaluated_opacity = self.opacity_activation(evaluated_opacity_logits)
-        else:  # bspline
-            # For B-splines, we'll use linear interpolation between control points
-            evaluated_xyz = torch.zeros((t_values_for_eval.shape[0], self.num_points, 2), device=self.device)
-            evaluated_cholesky = torch.zeros((t_values_for_eval.shape[0], self.num_points, 3), device=self.device)
-            evaluated_opacity = torch.zeros((t_values_for_eval.shape[0], self.num_points, 1), device=self.device)
+        # cholesky: (num_coeffs, N, 3) @ (T_eval, num_coeffs)^T -> (N, 3, T_eval) -> (T_eval, N, 3)
+        evaluated_cholesky_raw = torch.einsum('dnp,td->tnp', self._cholesky_coeffs, t_power_matrix_eval_xyz_chol)
+        evaluated_cholesky = evaluated_cholesky_raw + self.cholesky_bound
 
-            for i, t in enumerate(t_values_for_eval):
-                # Normalize t to [0, K-1] range
-                t_normalized = t.item() * (self.K_control_points - 1)
-                t_idx = int(t_normalized)
-                t_frac = t_normalized - t_idx
-
-                if t_idx >= self.K_control_points - 1:
-                    # Use last control point
-                    evaluated_xyz[i] = torch.tanh(self._xyz_control_points[:, -1])
-                    evaluated_cholesky[i] = self._cholesky_control_points[:, -1] + self.cholesky_bound
-                    evaluated_opacity[i] = self.opacity_activation(self._opacity_control_points[:, -1])
-                else:
-                    # Linear interpolation between control points
-                    xyz1 = torch.tanh(self._xyz_control_points[:, t_idx])
-                    xyz2 = torch.tanh(self._xyz_control_points[:, t_idx + 1])
-                    evaluated_xyz[i] = xyz1 * (1 - t_frac) + xyz2 * t_frac
-
-                    chol1 = self._cholesky_control_points[:, t_idx]
-                    chol2 = self._cholesky_control_points[:, t_idx + 1]
-                    evaluated_cholesky[i] = (chol1 * (1 - t_frac) + chol2 * t_frac) + self.cholesky_bound
-
-                    opac1 = self._opacity_control_points[:, t_idx]
-                    opac2 = self._opacity_control_points[:, t_idx + 1]
-                    evaluated_opacity[i] = self.opacity_activation(opac1 * (1 - t_frac) + opac2 * t_frac)
+        # opacity: (num_coeffs, N, 1) @ (T_eval, num_coeffs)^T -> (N, 1, T_eval) -> (T_eval, N, 1)
+        evaluated_opacity_logits = torch.einsum('dnp,td->tnp', self._opacity_coeffs, t_power_matrix_eval_opacity)
+        evaluated_opacity = self.opacity_activation(evaluated_opacity_logits)
 
         return evaluated_xyz, evaluated_cholesky, evaluated_opacity
 
@@ -417,252 +494,6 @@ class GaussianImage_Cholesky(nn.Module):
         _, top_indices = torch.topk(movement_metric, k=num_top_k)
         return top_indices
 
-    def cluster_gaussians(self, method='temporal_spatial', n_clusters=5, use_gpu=True,
-                         spatial_weight=0.3, motion_weight=0.6, color_weight=0.1):
-        """Cluster Gaussians based on their temporal and spatial relationships to identify potential objects.
-
-        Args:
-            method (str): Clustering method to use. Options:
-                - 'temporal_spatial': Focus on motion coherence and spatial relationships
-            n_clusters (int): Number of clusters to create
-            use_gpu (bool): Whether to use GPU for computations if available
-            spatial_weight (float): Weight for spatial features (0-1)
-            motion_weight (float): Weight for motion features (0-1)
-            color_weight (float): Weight for color features (0-1)
-
-        Returns:
-            dict: Dictionary containing:
-                - 'labels': Cluster labels for each Gaussian
-                - 'centers': Cluster centers
-                - 'features': The features used for clustering
-                - 'feature_weights': The weights used for each feature type
-        """
-        import torch.nn.functional as F
-        from sklearn.cluster import KMeans
-        import numpy as np
-
-        if self.num_points == 0:
-            return {'labels': np.array([]), 'centers': None, 'features': None, 'feature_weights': None}
-
-        # Move computations to CPU for sklearn
-        device = torch.device('cpu')
-
-        # 1. Extract spatial features (initial position and scale)
-        if self.trajectory_model_type == "polynomial":
-            initial_xyz = torch.tanh(self._xyz_coeffs[0]).detach().cpu().numpy()  # (N, 2)
-            initial_cholesky = self._cholesky_coeffs[0].detach().cpu().numpy()  # (N, 3)
-        else:  # bspline
-            initial_xyz = torch.tanh(self._xyz_control_points[:, 0]).detach().cpu().numpy()  # (N, 2)
-            initial_cholesky = self._cholesky_control_points[:, 0].detach().cpu().numpy()  # (N, 3)
-
-        spatial_features = np.concatenate([initial_xyz, initial_cholesky], axis=1)  # (N, 5)
-
-        # 2. Extract temporal features (motion patterns)
-        if self.trajectory_model_type == "polynomial":
-            # Get non-constant coefficients for xyz trajectories
-            motion_coeffs = self._xyz_coeffs[1:].detach().cpu().numpy()  # (poly_degree, N, 2)
-        else:  # bspline
-            # For B-splines, we'll use the differences between consecutive control points
-            # as a proxy for motion
-            motion_coeffs = (self._xyz_control_points[:, 1:] - self._xyz_control_points[:, :-1]).detach().cpu().numpy()  # (N, K-1, 2)
-            motion_coeffs = motion_coeffs.transpose(1, 0, 2)  # (K-1, N, 2)
-
-        # Calculate velocity and acceleration at key points in time
-        t_points = np.linspace(0, 1, 5)  # Sample 5 points in time
-        velocities = []
-        accelerations = []
-
-        for t in t_points:
-            if self.trajectory_model_type == "polynomial":
-                # First derivative (velocity)
-                vel = np.zeros((self.num_points, 2))
-                for i in range(1, self.polynomial_degree + 1):
-                    vel += i * motion_coeffs[i-1] * (t ** (i-1))
-                velocities.append(vel)
-
-                # Second derivative (acceleration)
-                acc = np.zeros((self.num_points, 2))
-                for i in range(2, self.polynomial_degree + 1):
-                    acc += i * (i-1) * motion_coeffs[i-1] * (t ** (i-2))
-                accelerations.append(acc)
-            else:  # bspline
-                # For B-splines, we'll use the control point differences as velocity
-                # and their changes as acceleration
-                t_idx = int(t * (self.K_control_points - 1))
-                t_idx = min(t_idx, self.K_control_points - 2)  # Ensure we don't go out of bounds
-                vel = motion_coeffs[t_idx]  # (N, 2)
-                velocities.append(vel)
-
-                if t_idx < self.K_control_points - 2:
-                    acc = motion_coeffs[t_idx + 1] - motion_coeffs[t_idx]  # (N, 2)
-                else:
-                    acc = np.zeros_like(vel)
-                accelerations.append(acc)
-
-        # Stack velocities and accelerations
-        velocities = np.stack(velocities, axis=1)  # (N, 5, 2)
-        accelerations = np.stack(accelerations, axis=1)  # (N, 5, 2)
-
-        # Flatten temporal features
-        temporal_features = np.concatenate([
-            velocities.reshape(self.num_points, -1),  # (N, 10)
-            accelerations.reshape(self.num_points, -1),  # (N, 10)
-            motion_coeffs.reshape(self.num_points, -1)  # (N, poly_degree * 2) or (N, (K-1) * 2)
-        ], axis=1)
-
-        # 3. Extract color features (as a secondary cue)
-        colors = self.get_features.detach().cpu().numpy()  # (N, 3)
-
-        # Normalize each feature type
-        spatial_features = (spatial_features - spatial_features.mean(axis=0)) / (spatial_features.std(axis=0) + 1e-8)
-        temporal_features = (temporal_features - temporal_features.mean(axis=0)) / (temporal_features.std(axis=0) + 1e-8)
-        colors = (colors - colors.mean(axis=0)) / (colors.std(axis=0) + 1e-8)
-
-        # Apply weights to each feature type
-        weighted_spatial = spatial_features * spatial_weight
-        weighted_temporal = temporal_features * motion_weight
-        weighted_color = colors * color_weight
-
-        # Combine all features
-        features = np.concatenate([weighted_spatial, weighted_temporal, weighted_color], axis=1)
-
-        # Perform K-means clustering
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-        labels = kmeans.fit_predict(features)
-
-        return {
-            'labels': labels,
-            'centers': kmeans.cluster_centers_,
-            'features': features,
-            'feature_weights': {
-                'spatial': spatial_weight,
-                'motion': motion_weight,
-                'color': color_weight
-            }
-        }
-
-    def visualize_clusters(self, cluster_results, frame_idx=0, save_path=None, show_velocity=False, dot_size=1):
-        """Visualize the clustering results by coloring Gaussians based on their cluster.
-
-        Args:
-            cluster_results (dict): Results from cluster_gaussians()
-            frame_idx (int): Which frame to visualize
-            save_path (str, optional): Path to save visualization
-            show_velocity (bool): Whether to show velocity vectors
-            dot_size (int): Size of dots in pixels
-        """
-        import matplotlib.pyplot as plt
-        import numpy as np
-
-        if self.num_points == 0:
-            print("No Gaussians to visualize")
-            return
-
-        # Get positions and velocities for the specified frame
-        t_value = self.t_values[frame_idx]
-
-        # Get positions based on trajectory model type
-        if self.trajectory_model_type == "polynomial":
-            # Create t_power_matrix for evaluation
-            t_power_matrix = torch.stack([t_value.pow(i) for i in range(self.polynomial_degree + 1)], dim=0)
-            # Evaluate polynomial
-            evaluated_xyz_logits = torch.einsum('dnp,d->np', self._xyz_coeffs, t_power_matrix)
-            positions = torch.tanh(evaluated_xyz_logits).detach().cpu().numpy()  # (N, 2)
-
-            # Calculate velocity if needed
-            if show_velocity:
-                vel = torch.zeros((self.num_points, 2), device=self.device)
-                for i in range(1, self.polynomial_degree + 1):
-                    vel += i * self._xyz_coeffs[i] * (t_value ** (i-1))
-                vel = vel.detach().cpu().numpy()
-        else:  # bspline
-            # For B-splines, we'll use the control points directly
-            # Find the two control points that bound the current time
-            t_normalized = t_value.item() * (self.K_control_points - 1)
-            t_idx = int(t_normalized)
-            t_frac = t_normalized - t_idx
-
-            if t_idx >= self.K_control_points - 1:
-                positions = torch.tanh(self._xyz_control_points[:, -1]).detach().cpu().numpy()
-                if show_velocity:
-                    vel = (self._xyz_control_points[:, -1] - self._xyz_control_points[:, -2]).detach().cpu().numpy()
-            else:
-                # Linear interpolation between control points
-                pos1 = torch.tanh(self._xyz_control_points[:, t_idx])
-                pos2 = torch.tanh(self._xyz_control_points[:, t_idx + 1])
-                positions = (pos1 * (1 - t_frac) + pos2 * t_frac).detach().cpu().numpy()
-                if show_velocity:
-                    vel = (self._xyz_control_points[:, t_idx + 1] - self._xyz_control_points[:, t_idx]).detach().cpu().numpy()
-
-        # Calculate figure size to maintain aspect ratio
-        aspect_ratio = self.W / self.H
-        fig_width = 12  # Base width
-        fig_height = fig_width / aspect_ratio
-
-        # Create figure with white background
-        plt.figure(figsize=(fig_width, fig_height), facecolor='white')
-        plt.gca().set_facecolor('white')
-
-        # Define vibrant colors for clusters
-        n_clusters = len(np.unique(cluster_results['labels']))
-        cluster_colors = [
-            '#FF0000',  # Red
-            '#00FF00',  # Green
-            '#0000FF',  # Blue
-            '#FF00FF',  # Magenta
-            '#00FFFF',  # Cyan
-            '#FFA500',  # Orange
-            '#800080',  # Purple
-            '#008000',  # Dark Green
-            '#000080',  # Navy
-            '#800000',  # Maroon
-        ][:n_clusters]  # Take only as many colors as we have clusters
-
-        # Plot each Gaussian as a point, colored by its cluster
-        for cluster_id in range(n_clusters):
-            mask = cluster_results['labels'] == cluster_id
-            cluster_color = cluster_colors[cluster_id]
-
-            # Plot points with cluster color
-            plt.scatter(positions[mask, 0], positions[mask, 1],
-                       c=[cluster_color], alpha=1.0, s=dot_size*2,  # Much smaller points
-                       label=f'Cluster {cluster_id}',
-                       edgecolor='black',  # Add black outline
-                       linewidth=0.5)  # Thin outline
-
-            if show_velocity and 'vel' in locals():
-                # Plot velocity vectors for this cluster
-                # Scale velocity for better visualization
-                vel_scale = 0.2  # Increased scale for more visible arrows
-                plt.quiver(positions[mask, 0], positions[mask, 1],
-                          vel[mask, 0] * vel_scale, vel[mask, 1] * vel_scale,
-                          color=cluster_color, alpha=0.8, scale=30,
-                          width=0.005,  # Thicker arrows
-                          headwidth=5,  # Larger arrow heads
-                          headlength=7)
-
-        plt.title(f'Gaussian Clusters (Frame {frame_idx})\n'
-                 f'Weights: Spatial={cluster_results["feature_weights"]["spatial"]:.1f}, '
-                 f'Motion={cluster_results["feature_weights"]["motion"]:.1f}, '
-                 f'Color={cluster_results["feature_weights"]["color"]:.1f}',
-                 pad=20, fontsize=12)
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
-        plt.grid(True, alpha=0.3)
-        plt.axis('equal')
-
-        # Set axis limits with some padding
-        x_min, x_max = positions[:, 0].min(), positions[:, 0].max()
-        y_min, y_max = positions[:, 1].min(), positions[:, 1].max()
-        padding = 0.1
-        plt.xlim(x_min - padding, x_max + padding)
-        plt.ylim(y_min - padding, y_max + padding)
-
-        if save_path:
-            plt.savefig(save_path, bbox_inches='tight', dpi=300, facecolor='white')
-            plt.close()
-        else:
-            plt.show()
-
     def forward(self, t_values_to_render: Optional[torch.Tensor] = None, background_color_override: Optional[torch.Tensor] = None):
         """Render frames specified by t_values_to_render.
         If t_values_to_render is None, renders all self.T frames.
@@ -676,14 +507,7 @@ class GaussianImage_Cholesky(nn.Module):
             return {"render": torch.empty(0, 3, self.H, self.W, device=self.device)}
 
         num_frames_to_render = t_values_to_render.shape[0]
-
-        # Use provided background override if given, otherwise use binary random background during training
-        if background_color_override is not None:
-            active_background = background_color_override
-        else:
-            # Generate binary random background (randomly choose between black and white)
-            is_white = torch.rand(1, device=self.device) > 0.5
-            active_background = torch.ones(3, device=self.device) if is_white else torch.zeros(3, device=self.device)
+        active_background = background_color_override if background_color_override is not None else torch.ones(3, device=self.device)
 
         # Get all parameters evaluated at the specified t_values
         evaluated_xyz, evaluated_cholesky, evaluated_opacity = self._get_evaluated_polynomials(t_values_to_render)

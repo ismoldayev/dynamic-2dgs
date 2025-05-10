@@ -11,6 +11,4 @@ Ninja
 # Add opencv for video loading
 opencv-python
 einops
-scikit-learn
-matplotlib
 # gsplat @ git+https://github.com/hbb1/gsplat@main

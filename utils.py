@@ -142,9 +142,10 @@ def video_path_to_tensor(video_path, num_frames=None, target_size=None, target_p
         video_path (str): Path to the video file.
         num_frames (int, optional): Number of frames to read. Reads all if None.
         target_size (tuple, optional): Target size (width, height). If None,
-                                     resizes based on target_pixel_count.
+                                     resizes based on a heuristic similar to
+                                     the original image processing.
         target_pixel_count (int, optional): Target number of pixels for resizing.
-                                          Default is 65536 (256x256).
+                                          Default is 65536 (256*256).
 
     Returns:
         torch.Tensor: Tensor containing video frames of shape (T, C, H, W).
