@@ -131,7 +131,12 @@ class GaussianImage_Cholesky(nn.Module):
                 t_power_matrix_opacity = torch.empty(0, self.opacity_polynomial_degree + 1, device=self.device)
             self.register_buffer('t_power_matrix_opacity', t_power_matrix_opacity, persistent=False)
 
-        self.opacity_activation = torch.sigmoid
+        # Custom opacity activation that maps sigmoid output to [0.9,1] range
+        def custom_opacity_activation(x):
+            sigmoid_out = torch.sigmoid(x)
+            return 0.9 + 0.1 * sigmoid_out  # Maps [0,1] to [0.9,1]
+
+        self.opacity_activation = custom_opacity_activation
         self.rgb_activation = torch.sigmoid
 
         # Initialize trajectory parameters based on model type
@@ -225,117 +230,11 @@ class GaussianImage_Cholesky(nn.Module):
 
             print("Finished custom initialization of color and opacity.")
 
-            # --- BEGIN INITIAL ANALYSIS AFTER CUSTOM INIT ---
-            with torch.no_grad():
-                # Color Analysis
-                raw_color_logits_init = self._features_dc.detach().cpu().numpy()
-                # Directly compute activated colors to avoid property lookup issue during __init__
-                activated_colors_init_tensor = self.rgb_activation(self._features_dc)
-                final_colors_init = activated_colors_init_tensor.detach().cpu().numpy()
-                print(f"\n--- Color Feature Analysis (After Custom Initialization) ---")
-                if raw_color_logits_init.size > 0:
-                    print("Raw Color Logits (_features_dc):")
-                    print(f"  Shape: {raw_color_logits_init.shape}")
-                    print(f"  Min: {np.min(raw_color_logits_init):.4f}, Max: {np.max(raw_color_logits_init):.4f}, Mean: {np.mean(raw_color_logits_init):.4f}, Median: {np.median(raw_color_logits_init):.4f}")
-                    print("Final Colors (after sigmoid):")
-                    print(f"  Shape: {final_colors_init.shape}")
-                    print(f"  Min: {np.min(final_colors_init):.4f}, Max: {np.max(final_colors_init):.4f}, Mean: {np.mean(final_colors_init):.4f}, Median: {np.median(final_colors_init):.4f}")
-                    for i_chan in range(final_colors_init.shape[1]):
-                        print(f"  Channel {i_chan} (RGB) - Min: {np.min(final_colors_init[:, i_chan]):.4f}, Max: {np.max(final_colors_init[:, i_chan]):.4f}, Mean: {np.mean(final_colors_init[:, i_chan]):.4f}")
-                else:
-                    print("No color features to analyze (num_points might be 0).")
-                print("--- End Initial Color Feature Analysis ---")
-
-                # Opacity Analysis
-                if self.num_points > 0:
-                    opacity_c0_logits_init_np = self._opacity_coeffs[0].detach().cpu().numpy().flatten()
-                    opacity_c0_sigmoid_init_np = torch.sigmoid(self._opacity_coeffs[0].detach().cpu()).numpy().flatten()
-                    all_opacities_tensor_init = self.get_opacity.detach().cpu()
-                    all_opacities_init_np = all_opacities_tensor_init.numpy().flatten()
-
-                    print(f"\n--- Opacity Distribution Analysis (After Custom Initialization) ---")
-                    if opacity_c0_logits_init_np.size > 0:
-                        print("Initial Opacity C0 Logits (_opacity_coeffs[0]):")
-                        print(f"  Shape: {opacity_c0_logits_init_np.shape}")
-                        print(f"  Min: {np.min(opacity_c0_logits_init_np):.4f}, Max: {np.max(opacity_c0_logits_init_np):.4f}, Mean: {np.mean(opacity_c0_logits_init_np):.4f}, Median: {np.median(opacity_c0_logits_init_np):.4f}")
-                        print("Initial Opacity C0 Sigmoid (_opacity_coeffs[0] after sigmoid):")
-                        print(f"  Shape: {opacity_c0_sigmoid_init_np.shape}")
-                        print(f"  Min: {np.min(opacity_c0_sigmoid_init_np):.4f}, Max: {np.max(opacity_c0_sigmoid_init_np):.4f}, Mean: {np.mean(opacity_c0_sigmoid_init_np):.4f}, Median: {np.median(opacity_c0_sigmoid_init_np):.4f}")
-
-                    if all_opacities_init_np.size > 0:
-                        print("Full Opacity Tensor (self.get_opacity, potentially time-varying):")
-                        print(f"  Opacities Tensor Shape (T, N, 1): {all_opacities_tensor_init.shape}")
-                        print(f"  Total Opacity Values Analyzed: {all_opacities_init_np.size}")
-                        print(f"  Min Opacity: {np.min(all_opacities_init_np):.4f}, Max Opacity: {np.max(all_opacities_init_np):.4f}, Mean Opacity: {np.mean(all_opacities_init_np):.4f}, Median Opacity: {np.median(all_opacities_init_np):.4f}")
-                        percentiles_opac = [10, 25, 50, 75, 90]
-                        perc_values_opac = np.percentile(all_opacities_init_np, percentiles_opac)
-                        for p_perc, v_perc in zip(percentiles_opac, perc_values_opac):
-                            print(f"  {p_perc}th Percentile: {v_perc:.4f}")
-                    else:
-                        print("  No full opacity tensor values to analyze.")
-                else:
-                    print("Skipping initial opacity distribution analysis: No Gaussians.")
-                print("--- End Initial Opacity Distribution Analysis ---")
-            # --- END INITIAL ANALYSIS AFTER CUSTOM INIT ---
-
         else:
             if gt_frames_for_init is not None:
                 print("Warning: Skipping custom Gaussian initialization. Conditions not met (e.g., no points, T=0, or frame shape mismatch).")
             # If not using custom init, _features_dc keeps its randn init, and _opacity_coeffs keeps its zeros init for c0.
             print("Using default (random/zero) initialization for color and opacity.")
-
-            # --- BEGIN INITIAL ANALYSIS AFTER DEFAULT INIT ---
-            with torch.no_grad():
-                # Color Analysis
-                raw_color_logits_default = self._features_dc.detach().cpu().numpy()
-                # Directly compute activated colors to avoid property lookup issue during __init__
-                activated_colors_default_tensor = self.rgb_activation(self._features_dc)
-                final_colors_default = activated_colors_default_tensor.detach().cpu().numpy()
-                print(f"\n--- Color Feature Analysis (Default Initial State) ---")
-                if raw_color_logits_default.size > 0:
-                    print("Raw Color Logits (_features_dc):")
-                    print(f"  Shape: {raw_color_logits_default.shape}")
-                    print(f"  Min: {np.min(raw_color_logits_default):.4f}, Max: {np.max(raw_color_logits_default):.4f}, Mean: {np.mean(raw_color_logits_default):.4f}, Median: {np.median(raw_color_logits_default):.4f}")
-                    print("Final Colors (after sigmoid):")
-                    print(f"  Shape: {final_colors_default.shape}")
-                    print(f"  Min: {np.min(final_colors_default):.4f}, Max: {np.max(final_colors_default):.4f}, Mean: {np.mean(final_colors_default):.4f}, Median: {np.median(final_colors_default):.4f}")
-                    for i_chan in range(final_colors_default.shape[1]):
-                        print(f"  Channel {i_chan} (RGB) - Min: {np.min(final_colors_default[:, i_chan]):.4f}, Max: {np.max(final_colors_default[:, i_chan]):.4f}, Mean: {np.mean(final_colors_default[:, i_chan]):.4f}")
-                else:
-                    print("No color features to analyze (num_points might be 0).")
-                print("--- End Default Initial Color Feature Analysis ---")
-
-                # Opacity Analysis
-                if self.num_points > 0:
-                    opacity_c0_logits_default_np = self._opacity_coeffs[0].detach().cpu().numpy().flatten()
-                    opacity_c0_sigmoid_default_np = torch.sigmoid(self._opacity_coeffs[0].detach().cpu()).numpy().flatten()
-                    all_opacities_tensor_default = self.get_opacity.detach().cpu()
-                    all_opacities_default_np = all_opacities_tensor_default.numpy().flatten()
-
-                    print(f"\n--- Opacity Distribution Analysis (Default Initial State) ---")
-                    if opacity_c0_logits_default_np.size > 0:
-                        print("Initial Opacity C0 Logits (_opacity_coeffs[0]):")
-                        print(f"  Shape: {opacity_c0_logits_default_np.shape}")
-                        print(f"  Min: {np.min(opacity_c0_logits_default_np):.4f}, Max: {np.max(opacity_c0_logits_default_np):.4f}, Mean: {np.mean(opacity_c0_logits_default_np):.4f}, Median: {np.median(opacity_c0_logits_default_np):.4f}")
-                        print("Initial Opacity C0 Sigmoid (_opacity_coeffs[0] after sigmoid):")
-                        print(f"  Shape: {opacity_c0_sigmoid_default_np.shape}")
-                        print(f"  Min: {np.min(opacity_c0_sigmoid_default_np):.4f}, Max: {np.max(opacity_c0_sigmoid_default_np):.4f}, Mean: {np.mean(opacity_c0_sigmoid_default_np):.4f}, Median: {np.median(opacity_c0_sigmoid_default_np):.4f}")
-
-                    if all_opacities_default_np.size > 0:
-                        print("Full Opacity Tensor (self.get_opacity, potentially time-varying):")
-                        print(f"  Opacities Tensor Shape (T, N, 1): {all_opacities_tensor_default.shape}")
-                        print(f"  Total Opacity Values Analyzed: {all_opacities_default_np.size}")
-                        print(f"  Min Opacity: {np.min(all_opacities_default_np):.4f}, Max Opacity: {np.max(all_opacities_default_np):.4f}, Mean Opacity: {np.mean(all_opacities_default_np):.4f}, Median Opacity: {np.median(all_opacities_default_np):.4f}")
-                        percentiles_opac_def = [10, 25, 50, 75, 90]
-                        perc_values_opac_def = np.percentile(all_opacities_default_np, percentiles_opac_def)
-                        for p_perc, v_perc in zip(percentiles_opac_def, perc_values_opac_def):
-                            print(f"  {p_perc}th Percentile: {v_perc:.4f}")
-                    else:
-                        print("  No full opacity tensor values to analyze.")
-                else:
-                    print("Skipping default initial opacity distribution analysis: No Gaussians.")
-                print("--- End Default Initial Opacity Distribution Analysis ---")
-            # --- END INITIAL ANALYSIS AFTER DEFAULT INIT ---
 
         # --- End New Initialization Logic ---
 
@@ -642,7 +541,7 @@ class GaussianImage_Cholesky(nn.Module):
             }
         }
 
-    def visualize_clusters(self, cluster_results, frame_idx=0, save_path=None, show_velocity=False):
+    def visualize_clusters(self, cluster_results, frame_idx=0, save_path=None, show_velocity=False, dot_size=1):
         """Visualize the clustering results by coloring Gaussians based on their cluster.
 
         Args:
@@ -650,6 +549,7 @@ class GaussianImage_Cholesky(nn.Module):
             frame_idx (int): Which frame to visualize
             save_path (str, optional): Path to save visualization
             show_velocity (bool): Whether to show velocity vectors
+            dot_size (int): Size of dots in pixels
         """
         import matplotlib.pyplot as plt
         import numpy as np
@@ -694,8 +594,13 @@ class GaussianImage_Cholesky(nn.Module):
                 if show_velocity:
                     vel = (self._xyz_control_points[:, t_idx + 1] - self._xyz_control_points[:, t_idx]).detach().cpu().numpy()
 
+        # Calculate figure size to maintain aspect ratio
+        aspect_ratio = self.W / self.H
+        fig_width = 12  # Base width
+        fig_height = fig_width / aspect_ratio
+
         # Create figure with white background
-        plt.figure(figsize=(12, 12), facecolor='white')
+        plt.figure(figsize=(fig_width, fig_height), facecolor='white')
         plt.gca().set_facecolor('white')
 
         # Define vibrant colors for clusters
@@ -720,7 +625,7 @@ class GaussianImage_Cholesky(nn.Module):
 
             # Plot points with cluster color
             plt.scatter(positions[mask, 0], positions[mask, 1],
-                       c=[cluster_color], alpha=1.0, s=100,  # Much larger points, full opacity
+                       c=[cluster_color], alpha=1.0, s=dot_size*2,  # Much smaller points
                        label=f'Cluster {cluster_id}',
                        edgecolor='black',  # Add black outline
                        linewidth=0.5)  # Thin outline

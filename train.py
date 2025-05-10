@@ -179,6 +179,13 @@ class VideoTrainer:
         psnr_list, iter_list = [], []
         progress_bar = tqdm(range(1, self.iterations + 1), desc="Training progress", disable=self.local_rank != 0)
 
+        # Add initial evaluation at iteration 0
+        if self.local_rank == 0:
+            print("\nPerforming initial evaluation at iteration 0...")
+            initial_psnr, initial_ms_ssim = self.evaluate_and_save_output(0, save_checkpoint=True)
+            psnr_list.append(initial_psnr)
+            iter_list.append(0)
+
         self.gaussian_model.train()
         start_time = time.time()
         for iter_idx in range(1, self.iterations + 1):

@@ -3,6 +3,7 @@ import argparse
 from pathlib import Path
 from gaussianimage_cholesky import GaussianImage_Cholesky
 import yaml
+import numpy as np
 
 def load_model_and_args(model_path):
     """Load model and its arguments from a checkpoint directory."""
@@ -48,89 +49,95 @@ def load_model_and_args(model_path):
     # Load model weights
     checkpoint = torch.load(model_path, map_location=model.device)
 
-    # Handle trajectory model type mismatch
-    if model.trajectory_model_type == "bspline" and "_xyz_coeffs" in checkpoint:
-        print("Converting polynomial trajectory parameters to B-spline control points...")
-        # Get the polynomial coefficients
-        xyz_coeffs = checkpoint["_xyz_coeffs"]
-        cholesky_coeffs = checkpoint["_cholesky_coeffs"]
+    # Load state dict with strict=False to handle any mismatches
+    try:
+        model.load_state_dict(checkpoint, strict=False)
+    except Exception as e:
+        print(f"Warning: Error loading state dict: {e}")
+        print("Attempting to load parameters individually...")
+        for key, value in checkpoint.items():
+            if hasattr(model, key):
+                try:
+                    getattr(model, key).data.copy_(value)
+                except Exception as e:
+                    print(f"Failed to load {key}: {e}")
 
-        # Create time points for evaluation
-        t_points = torch.linspace(0, 1, model.K_control_points, device=model.device)
+    # --- FORCE COPY B-SPLINE PARAMETERS IF PRESENT ---
+    with torch.no_grad():
+        if "_xyz_control_points" in checkpoint:
+            if model._xyz_control_points.shape == checkpoint["_xyz_control_points"].shape:
+                model._xyz_control_points.copy_(checkpoint["_xyz_control_points"])
+            else:
+                print(f"Shape mismatch for _xyz_control_points: model {model._xyz_control_points.shape}, checkpoint {checkpoint['_xyz_control_points'].shape}")
 
-        # Evaluate polynomial at control points
-        t_power_matrix = torch.stack([t_points.pow(i) for i in range(model.polynomial_degree + 1)], dim=1)
-        xyz_control_points = torch.einsum('dnp,td->tnp', xyz_coeffs, t_power_matrix)
-        cholesky_control_points = torch.einsum('dnp,td->tnp', cholesky_coeffs, t_power_matrix)
+        if "_cholesky_control_points" in checkpoint:
+            if model._cholesky_control_points.shape == checkpoint["_cholesky_control_points"].shape:
+                model._cholesky_control_points.copy_(checkpoint["_cholesky_control_points"])
+            else:
+                print(f"Shape mismatch for _cholesky_control_points: model {model._cholesky_control_points.shape}, checkpoint {checkpoint['_cholesky_control_points'].shape}")
 
-        # Update checkpoint with new parameters
-        checkpoint["_xyz_control_points"] = xyz_control_points.permute(1, 0, 2)  # (N, K, 2)
-        checkpoint["_cholesky_control_points"] = cholesky_control_points.permute(1, 0, 2)  # (N, K, 3)
+        if "_opacity_control_points" in checkpoint:
+            if model._opacity_control_points.shape == checkpoint["_opacity_control_points"].shape:
+                model._opacity_control_points.copy_(checkpoint["_opacity_control_points"])
+            else:
+                print(f"Shape mismatch for _opacity_control_points: model {model._opacity_control_points.shape}, checkpoint {checkpoint['_opacity_control_points'].shape}")
 
-        # Remove old parameters
-        del checkpoint["_xyz_coeffs"]
-        del checkpoint["_cholesky_coeffs"]
+    # Verify color values after loading
+    print("\nColor values after loading checkpoint:")
+    with torch.no_grad():
+        raw_color_logits = model._features_dc.detach().cpu().numpy()
+        final_colors = model.get_features.detach().cpu().numpy()
+        print("Raw Color Logits (_features_dc):")
+        print(f"  Shape: {raw_color_logits.shape}")
+        print(f"  Min: {np.min(raw_color_logits):.4f}, Max: {np.max(raw_color_logits):.4f}, Mean: {np.mean(raw_color_logits):.4f}, Median: {np.median(raw_color_logits):.4f}")
+        print("Final Colors (after sigmoid):")
+        print(f"  Shape: {final_colors.shape}")
+        print(f"  Min: {np.min(final_colors):.4f}, Max: {np.max(final_colors):.4f}, Mean: {np.mean(final_colors):.4f}, Median: {np.median(final_colors):.4f}")
+        for i in range(final_colors.shape[1]):
+            print(f"  Channel {i} (RGB) - Min: {np.min(final_colors[:, i]):.4f}, Max: {np.max(final_colors[:, i]):.4f}, Mean: {np.mean(final_colors[:, i]):.4f}")
 
-    elif model.trajectory_model_type == "polynomial" and "_xyz_control_points" in checkpoint:
-        print("Converting B-spline control points to polynomial coefficients...")
-        # Get the control points
-        xyz_control_points = checkpoint["_xyz_control_points"]  # (N, K, 2)
-        cholesky_control_points = checkpoint["_cholesky_control_points"]  # (N, K, 3)
+    # Verify opacity values after loading
+    print("\nOpacity values after loading checkpoint:")
+    with torch.no_grad():
+        final_opacities = model.get_opacity
+        print(f"Shape: {final_opacities.shape}")
+        print(f"Min: {final_opacities.min().item():.4f}")
+        print(f"Max: {final_opacities.max().item():.4f}")
+        print(f"Mean: {final_opacities.mean().item():.4f}")
+        print(f"Median: {final_opacities.median().item():.4f}")
 
-        # Create time points for evaluation
-        t_points = torch.linspace(0, 1, model.K_control_points, device=model.device)
-
-        # Fit polynomial to control points
-        t_power_matrix = torch.stack([t_points.pow(i) for i in range(model.polynomial_degree + 1)], dim=1)
-        t_power_matrix_pinv = torch.linalg.pinv(t_power_matrix)
-
-        # Convert to polynomial coefficients
-        xyz_coeffs = torch.einsum('ntk,kn->tnk', xyz_control_points, t_power_matrix_pinv)
-        cholesky_coeffs = torch.einsum('ntk,kn->tnk', cholesky_control_points, t_power_matrix_pinv)
-
-        # Update checkpoint with new parameters
-        checkpoint["_xyz_coeffs"] = xyz_coeffs.permute(1, 0, 2)  # (D+1, N, 2)
-        checkpoint["_cholesky_coeffs"] = cholesky_coeffs.permute(1, 0, 2)  # (D+1, N, 3)
-
-        # Remove old parameters
-        del checkpoint["_xyz_control_points"]
-        del checkpoint["_cholesky_control_points"]
-
-    # Load the modified state dict
-    model.load_state_dict(checkpoint)
     model.eval()
-
     return model, args
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Cluster Gaussians from a trained model')
+    parser.add_argument('--model_path', type=str, required=True,
+                      help='Path to the model checkpoint')
+    parser.add_argument('--n_clusters', type=int, default=5,
+                      help='Number of clusters to create')
+    parser.add_argument('--motion_weight', type=float, default=0.6,
+                      help='Weight for motion features in clustering')
+    parser.add_argument('--spatial_weight', type=float, default=0.3,
+                      help='Weight for spatial features in clustering')
+    parser.add_argument('--color_weight', type=float, default=0.1,
+                      help='Weight for color features in clustering')
+    parser.add_argument('--show_velocity', action='store_true',
+                      help='Show velocity vectors in visualization')
+    parser.add_argument('--frame_idx', type=int, default=0,
+                      help='Frame index to visualize')
+    return parser.parse_args()
+
 def main():
-    parser = argparse.ArgumentParser(description="Cluster Gaussians from a trained model.")
-    parser.add_argument("--model_path", type=str, required=True,
-                      help="Path to the model checkpoint (.pth.tar file)")
-    parser.add_argument("--n_clusters", type=int, default=5,
-                      help="Number of clusters to create")
-    parser.add_argument("--motion_weight", type=float, default=0.6,
-                      help="Weight for motion features (0-1)")
-    parser.add_argument("--spatial_weight", type=float, default=0.3,
-                      help="Weight for spatial features (0-1)")
-    parser.add_argument("--color_weight", type=float, default=0.1,
-                      help="Weight for color features (0-1)")
-    parser.add_argument("--show_velocity", action="store_true",
-                      help="Show velocity vectors in visualization")
-    parser.add_argument("--frame_idx", type=int, default=0,
-                      help="Frame index to visualize")
+    args = parse_args()
 
-    args = parser.parse_args()
-
-    # Load model
-    print(f"Loading model from {args.model_path}")
+    # Load model and arguments
     model, model_args = load_model_and_args(args.model_path)
 
     # Create output directory
-    output_dir = Path(args.model_path).parent / "clustering_results"
+    output_dir = Path(args.model_path).parent / 'clustering_results'
     output_dir.mkdir(exist_ok=True)
 
     # Perform clustering
-    print("Performing clustering...")
     cluster_results = model.cluster_gaussians(
         n_clusters=args.n_clusters,
         motion_weight=args.motion_weight,
@@ -138,17 +145,25 @@ def main():
         color_weight=args.color_weight
     )
 
+    # Generate filename based on clustering parameters
+    param_str = f"n{args.n_clusters}_m{args.motion_weight:.1f}_s{args.spatial_weight:.1f}_c{args.color_weight:.1f}"
+    if args.show_velocity:
+        param_str += "_vel"
+
+    # Calculate dot size based on image dimensions
+    dot_size = max(1, int(min(model.H, model.W) * 0.002))  # 0.002 of minimum image dimension
+
     # Visualize clusters
-    print("Visualizing clusters...")
-    save_path = output_dir / f"clusters_frame{args.frame_idx}_n{args.n_clusters}_m{args.motion_weight:.1f}_s{args.spatial_weight:.1f}_c{args.color_weight:.1f}.png"
+    save_path = output_dir / f"clusters_{param_str}_frame{args.frame_idx}.png"
     model.visualize_clusters(
         cluster_results,
         frame_idx=args.frame_idx,
         save_path=save_path,
-        show_velocity=args.show_velocity
+        show_velocity=args.show_velocity,
+        dot_size=dot_size
     )
 
-    print(f"Results saved to {save_path}")
+    print(f"Clustering results saved to {save_path}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
