@@ -698,11 +698,11 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description="Train dynamic 2D Gaussians on a video.")
     # Video input arguments
     parser.add_argument("--video_path", type=str, required=True, help="Path to the input video file")
-    parser.add_argument("--num_frames", type=int, default=10, help="Total number of evenly spaced frames to load from the video. These frames will be used for all training iterations and for final evaluation/rendering. If 0 or > total video frames, all actual video frames are loaded and used. (default: %(default)s)")
+    parser.add_argument("--num_frames", type=int, default=0, help="Number of frames to randomly select for each training iteration. All frames from the video are loaded, but this controls how many are used per training step. If 0, all frames are used in each iteration. (default: %(default)s)")
     parser.add_argument("--target_pixel_count", type=int, default=65536, help="Target number of pixels for resizing frames (default: %(default)s = 256*256)")
     # Training parameters
-    parser.add_argument("--iterations", type=int, default=30000, help="Number of training iterations (default: %(default)s)")
-    parser.add_argument("--num_points", type=int, default=5000, help="Number of 2D Gaussian points (default: %(default)s)")
+    parser.add_argument("--iterations", type=int, default=10000, help="Number of training iterations (default: %(default)s)")
+    parser.add_argument("--num_points", type=int, default=20000, help="Number of 2D Gaussian points (default: %(default)s)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: %(default)s)")
     parser.add_argument("--opt_type", type=str, default="adan", choices=["adan", "adam"], help="Optimizer type (default: %(default)s)")
     # Other options
@@ -712,21 +712,11 @@ def parse_args(argv):
     parser.add_argument("--output_fps", type=float, default=None, help="FPS for the output video. If not specified, an effective FPS is calculated to preserve original video duration based on sampled frames. (default: %(default)s)")
     parser.add_argument("--lambda_neighbor_rigidity", type=float, default=0.0, help="Strength of neighbor rigidity loss (maintaining inter-Gaussian distances) (default: %(default)s)")
     parser.add_argument("--k_neighbors", type=int, default=5, help="Number of neighbors for rigidity loss (default: %(default)s)")
-    # Densification arguments
-    parser.add_argument("--densify_from_iter", type=int, default=500, help="Iteration to start densification (default: %(default)s)")
-    parser.add_argument("--densify_until_iter", type=int, default=15000, help="Iteration to stop densification (default: %(default)s)")
-    parser.add_argument("--densification_interval", type=int, default=100, help="Interval for densification (every N iterations) (default: %(default)s)")
-    parser.add_argument("--size_threshold_split", type=float, default=0.01, help="Average scale threshold to split a Gaussian (default: %(default)s, placeholder value)")
-    parser.add_argument("--opacity_threshold_clone", type=float, default=0.9, help="Opacity threshold to clone a small Gaussian (default: %(default)s, placeholder value)")
-    parser.add_argument("--scale_factor_split_children", type=float, default=0.6, help="Scale factor for Cholesky of children when splitting (default: %(default)s)")
-    parser.add_argument("--max_gaussians", type=int, default=60000, help="Maximum number of Gaussians after densification (default: %(default)s)")
-    parser.add_argument("--lr_final", type=float, default=1e-05, help="Final learning rate for cosine decay (default: %(default)s)")
-    parser.add_argument("--lr_delay_mult", type=float, default=0.1, help="Learning rate delay multiplier (default: %(default)s)") # From 3DGS
-    parser.add_argument("--lr_delay_steps", type=int, default=0, help="Learning rate delay steps (default: %(default)s)") # From 3DGS
+    # Learning rate arguments
     parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay rate for temporal regularization")
     parser.add_argument("--polynomial_degree", type=int, default=7, help="Degree of the polynomial for time representation (XYZ, Cholesky) (default: %(default)s)")
-    parser.add_argument("--opacity_polynomial_degree", type=int, default=None, help="Degree of the polynomial for opacity time representation. If None, uses polynomial_degree. (default: %(default)s)")
-    parser.add_argument("--checkpoint_interval", type=int, default=10000, help="Interval for saving model checkpoints (default: %(default)s, 0 for no periodic checkpoints)")
+    parser.add_argument("--opacity_polynomial_degree", type=int, default=0, help="Degree of the polynomial for opacity time representation. If None, uses polynomial_degree. (default: %(default)s)")
+    parser.add_argument("--checkpoint_interval", type=int, default=20000, help="Interval for saving model checkpoints (default: %(default)s, 0 for no periodic checkpoints)")
     # New coefficient regularization arguments
     parser.add_argument("--lambda_xyz_coeffs_reg", type=float, default=0.0, help="Strength of L2 regularization on XYZ polynomial coeffs (default: %(default)s)")
     parser.add_argument("--lambda_cholesky_coeffs_reg", type=float, default=0.0, help="Strength of L2 regularization on Cholesky polynomial coeffs (default: %(default)s)")
