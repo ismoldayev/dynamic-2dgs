@@ -9,6 +9,7 @@ import math
 from optimizer import Adan
 from typing import Optional
 import torch.nn.functional as F # For cosine similarity
+from scipy.interpolate import BSpline
 
 # Helper for logit transformation
 def _logit(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -157,16 +158,116 @@ class GaussianImage_Cholesky(nn.Module):
             print(f"Using B-SPLINE model for XYZ/Cholesky trajectories with K={self.K_control_points} control points and degree {self.bspline_degree}.")
 
             # Base initial values (static state for all K control points)
-            initial_xyz_base_spline = torch.atanh(2 * (torch.rand(self.num_points, 2, device=self.device) - 0.5))
+            eps = 1e-6
+            uniform_values = torch.rand(self.num_points, 2, device=self.device) * (1 - 2*eps) + eps
+            initial_xyz_base_spline = torch.atanh(2 * uniform_values - 1)
 
+            # Initialize with much larger covariance (1.0 standard deviation)
             _init_chol_c0_part1_spline = torch.tensor([1.0, 0.0, 1.0], device=self.device).view(1, 3).repeat(self.num_points, 1)
             _init_chol_c0_part2_spline = torch.randn(self.num_points, 3, device=self.device) * 0.01
             initial_cholesky_base_spline = _init_chol_c0_part1_spline + _init_chol_c0_part2_spline
 
-            self._xyz_control_points = nn.Parameter(initial_xyz_base_spline.unsqueeze(1).repeat(1, self.K_control_points, 1))
-            self._cholesky_control_points = nn.Parameter(initial_cholesky_base_spline.unsqueeze(1).repeat(1, self.K_control_points, 1))
+            # Initialize control points with small random offsets
+            xyz_control_points = []
+            for k in range(self.K_control_points):
+                if k == 0:
+                    # First control point is the base position
+                    xyz_control_points.append(initial_xyz_base_spline)
+                else:
+                    # Subsequent control points have small random offsets
+                    offset = torch.randn(self.num_points, 2, device=self.device) * 0.1  # Small random offset
+                    xyz_control_points.append(initial_xyz_base_spline + offset)
+            self._xyz_control_points = nn.Parameter(torch.stack(xyz_control_points, dim=1))  # Shape: (N, K, 2)
+
+            # Initialize Cholesky control points with small random offsets
+            cholesky_control_points = []
+            for k in range(self.K_control_points):
+                if k == 0:
+                    # First control point is the base position
+                    cholesky_control_points.append(initial_cholesky_base_spline)
+                else:
+                    # Subsequent control points have small random offsets
+                    offset = torch.randn(self.num_points, 3, device=self.device) * 0.01  # Smaller offset for Cholesky
+                    cholesky_control_points.append(initial_cholesky_base_spline + offset)
+            self._cholesky_control_points = nn.Parameter(torch.stack(cholesky_control_points, dim=1))  # Shape: (N, K, 3)
 
             self._initial_xyz_for_custom_init = initial_xyz_base_spline.clone().detach()
+
+            # Pre-compute and cache basis functions for all possible t values
+            self.bspline_resolution = 10000  # Increased from 1000 to handle more interpolated frames
+            t_grid = torch.linspace(0, 1, self.bspline_resolution, device=self.device)
+
+            # Create knot vector with repeated knots at start and end
+            total_knots = self.K_control_points + self.bspline_degree + 1
+            knots = torch.zeros(total_knots, device=self.device)
+
+            # First p+1 knots are 0
+            knots[:self.bspline_degree + 1] = 0.0
+
+            # Last p+1 knots are 1
+            knots[-self.bspline_degree - 1:] = 1.0
+
+            # Calculate number of middle knots that need to be set
+            num_middle_knots = total_knots - 2 * (self.bspline_degree + 1)
+            if num_middle_knots > 0:
+                # Create evenly spaced values between 0 and 1 for middle knots
+                middle_values = torch.linspace(0, 1, num_middle_knots + 2, device=self.device)[1:-1]  # Exclude 0 and 1
+                middle_start_idx = self.bspline_degree + 1
+                knots[middle_start_idx:middle_start_idx + num_middle_knots] = middle_values
+
+            # Create basis functions directly (vectorized)
+            basis_functions = torch.zeros(self.bspline_resolution, self.K_control_points, device=self.device)
+            eps = 1e-6  # Small epsilon for numerical stability
+
+            # Compute basis functions for each control point
+            for i in range(self.K_control_points):
+                # Initialize degree 0 basis functions
+                basis = torch.zeros(self.bspline_resolution, device=self.device)
+                for j in range(self.bspline_degree + 1):
+                    t_start = knots[i + j]
+                    t_end = knots[i + j + 1]
+                    valid_mask = (t_grid >= t_start - eps) & (t_grid < t_end + eps)
+                    basis = torch.where(valid_mask, torch.ones_like(basis), basis)
+
+                # Recursively compute higher degree basis functions
+                for d in range(1, self.bspline_degree + 1):
+                    new_basis = torch.zeros_like(basis)
+                    for j in range(self.bspline_degree - d + 1):
+                        # Get knot values for this basis function
+                        t_start = knots[i + j]
+                        t_end = knots[i + j + d + 1]
+                        t_mid = knots[i + j + d]
+
+                        # Calculate denominators with epsilon check
+                        denom1 = t_mid - t_start
+                        denom2 = t_end - t_mid
+
+                        # Create masks for valid ranges with epsilon
+                        valid_range1 = (t_grid >= t_start - eps) & (t_grid < t_mid + eps) & (denom1 > eps)
+                        valid_range2 = (t_grid >= t_mid - eps) & (t_grid < t_end + eps) & (denom2 > eps)
+
+                        # Calculate basis function values with safe division
+                        term1 = torch.where(valid_range1,
+                                          (t_grid - t_start) / (denom1 + eps) * basis,
+                                          torch.zeros_like(basis))
+                        term2 = torch.where(valid_range2,
+                                          (t_end - t_grid) / (denom2 + eps) * basis,
+                                          torch.zeros_like(basis))
+
+                        new_basis = new_basis + term1 + term2
+
+                    basis = new_basis
+
+                # Store the basis functions for this control point
+                basis_functions[:, i] = basis
+
+            # Normalize basis functions to ensure they sum to 1 at each point
+            basis_sum = basis_functions.sum(dim=1, keepdim=True)
+            basis_functions = basis_functions / (basis_sum + eps)
+
+            self.register_buffer('basis_functions_grid', basis_functions)
+            self.register_buffer('t_grid', t_grid)
+
         else:
             raise ValueError(f"Unknown trajectory_model_type: {self.trajectory_model_type}")
 
@@ -223,6 +324,11 @@ class GaussianImage_Cholesky(nn.Module):
             current_opacity_coeffs = self._opacity_coeffs.data.clone()
             current_opacity_coeffs[0] = opacity_c0_logits.unsqueeze(-1) # Add channel dim
             self._opacity_coeffs.data = current_opacity_coeffs
+
+            # For B-spline model, initialize all control points based on the initial position
+            if self.trajectory_model_type == "bspline":
+                # Initialize all control points to exactly the same position for static start
+                self._xyz_control_points.data = initial_xyz_c0_detached.unsqueeze(1).repeat(1, self.K_control_points, 1)
 
             print("Finished custom initialization of color and opacity.")
 
@@ -375,12 +481,13 @@ class GaussianImage_Cholesky(nn.Module):
         # Initialize neighbor information for rigidity loss
         if self.lambda_neighbor_rigidity > 0 and self.num_points > self.k_neighbors and self.T > 1 and self.k_neighbors > 0:
             with torch.no_grad(): # Operations here should not be part of the computation graph for _xyz init
-                # Detach explicitly if get_xyz involves operations on parameters being optimized
-                xyz_t0 = self.get_xyz[0].clone().detach() # Shape (N, 2)
+                # For B-splines, use the first control point as initial position
+                if self.trajectory_model_type == "bspline":
+                    xyz_t0 = torch.tanh(self._xyz_control_points[:, 0])  # Shape (N, 2)
+                else:  # polynomial
+                    xyz_t0 = torch.tanh(self._xyz_coeffs[0])  # Shape (N, 2)
 
                 # Pairwise squared Euclidean distances
-                # cdist computes L2 norm (Euclidean distance), then we square it for consistency with some formulations
-                # However, working with direct distances (sqrt) is fine and perhaps more intuitive.
                 pairwise_distances = torch.cdist(xyz_t0, xyz_t0, p=2.0) # Shape (N, N)
                 pairwise_distances.fill_diagonal_(float('inf')) # Ignore distance to self
 
@@ -389,7 +496,6 @@ class GaussianImage_Cholesky(nn.Module):
                 )
                 self.register_buffer('initial_neighbor_distances', initial_neighbor_distances, persistent=False)
                 self.register_buffer('neighbor_indices', neighbor_indices, persistent=False)
-                # print(f"Initialized neighbor rigidity buffers. Shapes: D={self.initial_neighbor_distances.shape}, I={self.neighbor_indices.shape}")
         else:
             if self.lambda_neighbor_rigidity > 0:
                 print("Warning: Neighbor rigidity loss not initialized due to insufficient points, T<=1, or k_neighbors<=0.")
@@ -438,13 +544,98 @@ class GaussianImage_Cholesky(nn.Module):
 
         return evaluated_xyz, evaluated_cholesky, evaluated_opacity
 
+    def _get_evaluated_bsplines(self, t_values_for_eval: torch.Tensor):
+        """Helper to evaluate all time-varying B-splines for a given set of t_values using pre-computed basis functions."""
+        if t_values_for_eval.numel() == 0:
+            return (
+                torch.empty(0, self.num_points, 2, device=self.device),
+                torch.empty(0, self.num_points, 3, device=self.device),
+                torch.empty(0, self.num_points, 1, device=self.device)
+            )
+
+        # Ensure t is in [0, 1] range
+        t_values_for_eval = torch.clamp(t_values_for_eval, 0.0, 1.0)
+
+        # Get grid indices with interpolation (vectorized)
+        t_scaled = t_values_for_eval * (self.bspline_resolution - 1)
+        t_floor = torch.floor(t_scaled).long()
+        t_ceil = torch.ceil(t_scaled).long()
+        t_frac = t_scaled - t_floor.float()
+
+        # Ensure indices are within bounds (vectorized)
+        t_floor = torch.clamp(t_floor, 0, self.bspline_resolution - 1)
+        t_ceil = torch.clamp(t_ceil, 0, self.bspline_resolution - 1)
+
+        # Get basis functions for both floor and ceil indices (vectorized)
+        basis_floor = self.basis_functions_grid[t_floor]  # Shape: (T, K)
+        basis_ceil = self.basis_functions_grid[t_ceil]    # Shape: (T, K)
+
+        # Linear interpolation between floor and ceil basis functions (vectorized)
+        basis_functions = (1 - t_frac.unsqueeze(1)) * basis_floor + t_frac.unsqueeze(1) * basis_ceil  # Shape: (T, K)
+
+        # Evaluate XYZ positions (vectorized)
+        evaluated_xyz_logits = torch.einsum('tk,nkp->tnp', basis_functions, self._xyz_control_points)  # Shape: (T, N, 2)
+        evaluated_xyz = torch.tanh(evaluated_xyz_logits)
+
+        # Evaluate Cholesky elements (vectorized)
+        evaluated_cholesky_raw = torch.einsum('tk,nkp->tnp', basis_functions, self._cholesky_control_points)  # Shape: (T, N, 3)
+        evaluated_cholesky = evaluated_cholesky_raw + self.cholesky_bound
+
+        # For opacity, we still use polynomial evaluation
+        # Create power matrix for opacity evaluation (vectorized)
+        t_power_matrix_opacity = torch.ones_like(t_values_for_eval).unsqueeze(1)  # t^0
+        if self.opacity_polynomial_degree > 0:
+            for i in range(1, self.opacity_polynomial_degree + 1):
+                t_power_matrix_opacity = torch.cat([t_power_matrix_opacity, t_values_for_eval.pow(i).unsqueeze(1)], dim=1)
+
+        evaluated_opacity_logits = torch.einsum('dnp,td->tnp', self._opacity_coeffs, t_power_matrix_opacity)
+        evaluated_opacity = self.opacity_activation(evaluated_opacity_logits)
+
+        return evaluated_xyz, evaluated_cholesky, evaluated_opacity
+
     @property
     def get_xyz(self):
-        """Evaluates polynomial for means for ALL self.T frames, returns (T, N, 2)."""
+        """Evaluates means for ALL self.T frames, returns (T, N, 2)."""
         if self.T == 0:
             return torch.empty(0, self.num_points, 2, device=self.device)
-        evaluated_xyz_logits = torch.einsum('dnp,td->tnp', self._xyz_coeffs, self.t_power_matrix)
-        return torch.tanh(evaluated_xyz_logits)
+
+        if self.trajectory_model_type == "polynomial":
+            evaluated_xyz_logits = torch.einsum('dnp,td->tnp', self._xyz_coeffs, self.t_power_matrix)
+            return torch.tanh(evaluated_xyz_logits)
+        elif self.trajectory_model_type == "bspline":
+            # Compute knot vector for cubic B-splines
+            knots = torch.linspace(0, 1, self.K_control_points + self.bspline_degree + 1, device=self.device)
+
+            # Compute basis functions for each t value
+            basis_functions = torch.zeros(self.T, self.K_control_points, device=self.device)
+
+            for t_idx, t in enumerate(self.t_values):
+                # Find the knot span containing t
+                span = torch.searchsorted(knots, t, right=True) - 1
+                span = torch.clamp(span, self.bspline_degree, self.K_control_points - 1)
+
+                # Initialize basis functions for degree 0
+                basis = torch.zeros(self.bspline_degree + 1, device=self.device)
+                basis[0] = 1.0
+
+                # Compute basis functions for higher degrees
+                for d in range(1, self.bspline_degree + 1):
+                    for i in range(d + 1):
+                        idx = span - d + i
+                        if idx >= 0 and idx < self.K_control_points:
+                            if knots[idx + d] - knots[idx] > 1e-6:
+                                basis[i] = (t - knots[idx]) / (knots[idx + d] - knots[idx]) * basis[i-1]
+                            if knots[idx + d + 1] - knots[idx + 1] > 1e-6:
+                                basis[i] += (knots[idx + d + 1] - t) / (knots[idx + d + 1] - knots[idx + 1]) * basis[i]
+
+                # Store the basis functions for this t value
+                basis_functions[t_idx, span - self.bspline_degree:span + 1] = basis[:self.bspline_degree + 1]
+
+            # Evaluate XYZ positions
+            evaluated_xyz_logits = torch.einsum('tk,nkp->tnp', basis_functions, self._xyz_control_points)
+            return torch.tanh(evaluated_xyz_logits)
+        else:
+            raise ValueError(f"Unknown trajectory_model_type: {self.trajectory_model_type}")
 
     @property
     def get_features(self):
@@ -510,7 +701,13 @@ class GaussianImage_Cholesky(nn.Module):
         active_background = background_color_override if background_color_override is not None else torch.ones(3, device=self.device)
 
         # Get all parameters evaluated at the specified t_values
-        evaluated_xyz, evaluated_cholesky, evaluated_opacity = self._get_evaluated_polynomials(t_values_to_render)
+        if self.trajectory_model_type == "polynomial":
+            evaluated_xyz, evaluated_cholesky, evaluated_opacity = self._get_evaluated_polynomials(t_values_to_render)
+        elif self.trajectory_model_type == "bspline":
+            evaluated_xyz, evaluated_cholesky, evaluated_opacity = self._get_evaluated_bsplines(t_values_to_render)
+        else:
+            raise ValueError(f"Unknown trajectory_model_type: {self.trajectory_model_type}")
+
         static_colors = self.get_features # (N, 3), still static
 
         all_frames_rendered = []
@@ -522,7 +719,8 @@ class GaussianImage_Cholesky(nn.Module):
             xys, depths_from_projection, radii, conics, num_tiles_hit = project_gaussians_2d(
                 means_k, cholesky_k, self.H, self.W, self.tile_bounds
             )
-            effective_depths = 1.0 - opacities_k
+            # Use actual depths from projection instead of opacity-based depths
+            effective_depths = depths_from_projection
 
             out_img_k = rasterize_gaussians_sum(
                 xys, effective_depths, radii, conics, num_tiles_hit,
@@ -563,28 +761,39 @@ class GaussianImage_Cholesky(nn.Module):
         average_loss = total_loss / T_batch
         average_psnr = total_psnr / T_batch
 
-        # Add L2 regularization on polynomial coefficients (excluding constant term)
-        if self.polynomial_degree > 0:
-            if self.lambda_xyz_coeffs_reg > 0:
+        # Add L2 regularization on coefficients/control points
+        if self.lambda_xyz_coeffs_reg > 0:
+            if self.trajectory_model_type == "polynomial":
                 # _xyz_coeffs shape: (num_coeffs, N, 2)
                 # Regularize coeffs[1:] (linear term upwards)
                 xyz_coeffs_to_reg = self._xyz_coeffs[1:]
                 xyz_coeffs_l2_loss = self.lambda_xyz_coeffs_reg * torch.mean(xyz_coeffs_to_reg**2)
                 average_loss += xyz_coeffs_l2_loss
+            elif self.trajectory_model_type == "bspline":
+                # For B-splines, regularize control points after the first one
+                xyz_control_points_to_reg = self._xyz_control_points[:, 1:]
+                xyz_coeffs_l2_loss = self.lambda_xyz_coeffs_reg * torch.mean(xyz_control_points_to_reg**2)
+                average_loss += xyz_coeffs_l2_loss
 
-            if self.lambda_cholesky_coeffs_reg > 0:
+        if self.lambda_cholesky_coeffs_reg > 0:
+            if self.trajectory_model_type == "polynomial":
                 # _cholesky_coeffs shape: (num_coeffs, N, 3)
                 # Regularize coeffs[1:] (linear term upwards)
                 cholesky_coeffs_to_reg = self._cholesky_coeffs[1:]
                 cholesky_coeffs_l2_loss = self.lambda_cholesky_coeffs_reg * torch.mean(cholesky_coeffs_to_reg**2)
                 average_loss += cholesky_coeffs_l2_loss
+            elif self.trajectory_model_type == "bspline":
+                # For B-splines, regularize control points after the first one
+                cholesky_control_points_to_reg = self._cholesky_control_points[:, 1:]
+                cholesky_coeffs_l2_loss = self.lambda_cholesky_coeffs_reg * torch.mean(cholesky_control_points_to_reg**2)
+                average_loss += cholesky_coeffs_l2_loss
 
-            if self.lambda_opacity_coeffs_reg > 0 and self.opacity_polynomial_degree > 0:
-                # _opacity_coeffs shape: (num_coeffs_opacity, N, 1)
-                # Regularize coeffs[1:] (linear term upwards)
-                opacity_coeffs_to_reg = self._opacity_coeffs[1:]
-                opacity_coeffs_l2_loss = self.lambda_opacity_coeffs_reg * torch.mean(opacity_coeffs_to_reg**2)
-                average_loss += opacity_coeffs_l2_loss
+        if self.lambda_opacity_coeffs_reg > 0 and self.opacity_polynomial_degree > 0:
+            # _opacity_coeffs shape: (num_coeffs_opacity, N, 1)
+            # Regularize coeffs[1:] (linear term upwards)
+            opacity_coeffs_to_reg = self._opacity_coeffs[1:]
+            opacity_coeffs_l2_loss = self.lambda_opacity_coeffs_reg * torch.mean(opacity_coeffs_to_reg**2)
+            average_loss += opacity_coeffs_l2_loss
 
         # Add neighbor rigidity loss
         if self.lambda_neighbor_rigidity > 0 and self.T > 1 and hasattr(self, 'neighbor_indices') and hasattr(self, 'initial_neighbor_distances'):
@@ -637,3 +846,35 @@ class GaussianImage_Cholesky(nn.Module):
 
         # print(f"Debug: type(average_loss)={type(average_loss)}, type(average_psnr)={type(average_psnr)}")
         return average_loss.item(), average_psnr
+
+    def get_xyz_at_time(self, t: torch.Tensor):
+        """Get XYZ positions for a specific time value or batch of time values.
+        Args:
+            t: Tensor of shape (B,) containing time values in [0,1]
+        Returns:
+            Tensor of shape (B, N, 2) containing XYZ positions
+        """
+        if self.trajectory_model_type == "polynomial":
+            # Create power matrix for the input time values
+            t_power_matrix = torch.ones_like(t).unsqueeze(1)  # t^0
+            if self.polynomial_degree > 0:
+                for i in range(1, self.polynomial_degree + 1):
+                    t_power_matrix = torch.cat([t_power_matrix, t.pow(i).unsqueeze(1)], dim=1)
+
+            # Evaluate XYZ positions
+            evaluated_xyz_logits = torch.einsum('dnp,bd->bnp', self._xyz_coeffs, t_power_matrix)
+            return torch.tanh(evaluated_xyz_logits)
+
+        elif self.trajectory_model_type == "bspline":
+            # Convert t to grid indices
+            grid_indices = (t * (self.bspline_resolution - 1)).long()
+            grid_indices = torch.clamp(grid_indices, 0, self.bspline_resolution - 1)
+
+            # Get pre-computed basis functions for the requested t values
+            basis_functions = self.basis_functions_grid[grid_indices]
+
+            # Evaluate XYZ positions
+            evaluated_xyz_logits = torch.einsum('tk,nkp->tnp', basis_functions, self._xyz_control_points)
+            return torch.tanh(evaluated_xyz_logits)
+        else:
+            raise ValueError(f"Unknown trajectory_model_type: {self.trajectory_model_type}")

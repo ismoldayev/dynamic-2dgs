@@ -11,4 +11,6 @@ Ninja
 # Add opencv for video loading
 opencv-python
 einops
+# Add ffmpeg for video encoding
+ffmpeg-python
 # gsplat @ git+https://github.com/hbb1/gsplat@main
