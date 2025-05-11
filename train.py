@@ -342,11 +342,16 @@ class VideoTrainer:
         gt_frames_for_eval = self.all_gt_frames[eval_indices] # GT frames for these specific indices
 
         # Create interpolated t_values for double the frames
-        num_interpolated_frames = num_eval_frames * 2
-        interpolated_t_values = torch.linspace(0, 1, num_interpolated_frames, device=self.device)
-        # Scale the t_values to match the original frame range
-        t_min, t_max = eval_t_values[0], eval_t_values[-1]
-        interpolated_t_values = t_min + (t_max - t_min) * interpolated_t_values
+        num_interpolated_frames = num_eval_frames * 2 - 1  # One less than double because we don't need to interpolate after the last frame
+        # Create pairs of original frame times and interpolate between them
+        original_times = eval_t_values
+        interpolated_t_values = torch.zeros(num_interpolated_frames, device=self.device)
+        for i in range(num_eval_frames):
+            # Original frame time
+            interpolated_t_values[i*2] = original_times[i]
+            # Interpolated frame time (halfway between this frame and next frame)
+            if i < num_eval_frames - 1:
+                interpolated_t_values[i*2 + 1] = (original_times[i] + original_times[i+1]) / 2
 
         # --- Gaussian Centers Dynamics Visualization ---
         try:
@@ -566,11 +571,11 @@ class VideoTrainer:
             if self.save_frames:
                 frame_save_dir = self.log_dir / f"rendered_frames_iter_{iteration}"
                 frame_save_dir.mkdir(parents=True, exist_ok=True)
-                video_save_path = self.log_dir / f"{self.video_name}_rendered_iter_{iteration}.mp4"
+                video_save_path = self.log_dir / f"{self.video_name}_rendered_interpolated_iter_{iteration}.mp4"
                 transform_to_pil = transforms.ToPILImage()
                 video_writer = cv2.VideoWriter(str(video_save_path),
                                              cv2.VideoWriter_fourcc(*'mp4v'),
-                                             self.output_fps,
+                                             self.output_fps * 2,  # Double the FPS for interpolated video
                                              (self.W, self.H),
                                              isColor=True)
 
@@ -590,16 +595,24 @@ class VideoTrainer:
                 total_ms_ssim_eval += ms_ssim_t
 
                 if self.save_frames and video_writer is not None:
-                    # Save both the original and interpolated frames
-                    for frame_idx in range(2):
-                        frame_to_save = out_frames_eval[k_eval*2 + frame_idx].cpu().permute(1, 2, 0)
+                    # Save the original frame
+                    frame_to_save = out_frames_eval[k_eval*2].cpu().permute(1, 2, 0)
+                    frame_np_rgb = (frame_to_save * 255).byte().numpy()
+                    if transform_to_pil is not None:
+                        img_pil = Image.fromarray(frame_np_rgb, 'RGB')
+                        frame_filename = f"eval_frame_{k_eval:04d}_orig_origIdx{eval_indices[k_eval]:04d}_psnr{psnr_t:.2f}.png"
+                        full_frame_path = frame_save_dir / frame_filename
+                        img_pil.save(full_frame_path)
+                    frame_np_bgr = cv2.cvtColor(frame_np_rgb, cv2.COLOR_RGB2BGR)
+                    video_writer.write(frame_np_bgr)
+
+                    # Save interpolated frame if not at the last original frame
+                    if k_eval < num_eval_frames - 1:
+                        frame_to_save = out_frames_eval[k_eval*2 + 1].cpu().permute(1, 2, 0)
                         frame_np_rgb = (frame_to_save * 255).byte().numpy()
-                        if transform_to_pil is not None: # Save PNG for both original and interpolated frames
+                        if transform_to_pil is not None:
                             img_pil = Image.fromarray(frame_np_rgb, 'RGB')
-                            # For original frames (frame_idx == 0), use the original naming
-                            # For interpolated frames (frame_idx == 1), add 'interp' to the filename
-                            frame_type = "orig" if frame_idx == 0 else "interp"
-                            frame_filename = f"eval_frame_{k_eval:04d}_{frame_type}_origIdx{eval_indices[k_eval]:04d}_psnr{psnr_t:.2f}.png"
+                            frame_filename = f"eval_frame_{k_eval:04d}_interp_origIdx{eval_indices[k_eval]:04d}_psnr{psnr_t:.2f}.png"
                             full_frame_path = frame_save_dir / frame_filename
                             img_pil.save(full_frame_path)
                         frame_np_bgr = cv2.cvtColor(frame_np_rgb, cv2.COLOR_RGB2BGR)
@@ -608,7 +621,31 @@ class VideoTrainer:
             if self.save_frames and video_writer is not None:
                 video_writer.release()
                 print(f"Finished saving output for iteration {iteration}.")
-        # --- End Reconstruction Video Rendering ---
+
+            # Create additional video with only original frames
+            if self.save_frames:
+                original_only_video_path = self.log_dir / f"{self.video_name}_rendered_original_only_iter_{iteration}.mp4"
+                original_only_video_writer = cv2.VideoWriter(str(original_only_video_path),
+                                                          cv2.VideoWriter_fourcc(*'mp4v'),
+                                                          self.output_fps,
+                                                          (self.W, self.H),
+                                                          isColor=True)
+
+                print(f"Saving original-frames-only video ({num_eval_frames} frames) to {original_only_video_path}")
+
+                # Render only original frames
+                with torch.no_grad():
+                    out_frames_pkg_original = self.gaussian_model.forward(t_values_to_render=eval_t_values)
+                    out_frames_original = out_frames_pkg_original["render"].float()
+
+                    for k_eval in range(num_eval_frames):
+                        frame_to_save = out_frames_original[k_eval].cpu().permute(1, 2, 0)
+                        frame_np_rgb = (frame_to_save * 255).byte().numpy()
+                        frame_np_bgr = cv2.cvtColor(frame_np_rgb, cv2.COLOR_RGB2BGR)
+                        original_only_video_writer.write(frame_np_bgr)
+
+                original_only_video_writer.release()
+                print(f"Finished saving original-frames-only video for iteration {iteration}.")
 
         if save_checkpoint:
             checkpoint_save_path = self.log_dir / f"gaussian_model_iter_{iteration}.pth.tar"
