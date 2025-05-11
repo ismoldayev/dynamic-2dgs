@@ -378,11 +378,18 @@ class VideoTrainer:
                 centers_video_path = self.log_dir / f"{self.video_name}_centers_iter_{iteration}.mp4"
                 print(f"\nCreating Gaussian centers visualization video...")
 
-                # Use the same approach as the reconstruction video
+                # Calculate scaled dimensions to maintain aspect ratio while having width*height ≈ 3*num_gaussians
+                target_pixels = 6 * self.gaussian_model.num_points
+                aspect_ratio = self.W / self.H
+                scaled_H = int(np.sqrt(target_pixels / aspect_ratio))
+                scaled_W = int(np.sqrt(target_pixels * aspect_ratio))
+                print(f"Scaling video to {scaled_W}x{scaled_H} (target: {target_pixels} pixels for {self.gaussian_model.num_points} Gaussians)")
+
+                # Use the same approach as the reconstruction video but with scaled resolution
                 video_writer = cv2.VideoWriter(str(centers_video_path),
                                              cv2.VideoWriter_fourcc(*'mp4v'),
                                              self.output_fps,
-                                             (self.W, self.H),
+                                             (scaled_W, scaled_H),
                                              isColor=True)
 
                 if not video_writer.isOpened():
@@ -394,24 +401,24 @@ class VideoTrainer:
                         temp_frame_paths = []
 
                         for k in range(num_eval_frames):
-                            # Create blank frame
-                            frame = np.zeros((self.H, self.W, 3), dtype=np.uint8)
+                            # Create blank frame with scaled resolution
+                            frame = np.zeros((scaled_H, scaled_W, 3), dtype=np.uint8)
 
                             # Get xyz positions for this frame
                             xyz_k = all_xyz_normalized[k] # (N, 2)
                             xyz_k_viz = xyz_k[visualized_gaussian_indices] # (num_gaussians_in_viz, 2)
 
-                            # Transform normalized coordinates to pixel coordinates
-                            x_coords = (xyz_k_viz[:, 0] * 0.5 + 0.5) * (self.W - 1)
-                            y_coords = (xyz_k_viz[:, 1] * 0.5 + 0.5) * (self.H - 1)
+                            # Transform normalized coordinates to pixel coordinates (scaled)
+                            x_coords = (xyz_k_viz[:, 0] * 0.5 + 0.5) * (scaled_W - 1)
+                            y_coords = (xyz_k_viz[:, 1] * 0.5 + 0.5) * (scaled_H - 1)
 
                             # Draw each Gaussian center
                             dots_visible_in_frame = 0
                             for i in range(num_gaussians_in_viz):
                                 x, y = int(x_coords[i]), int(y_coords[i])
-                                if 0 <= x < self.W and 0 <= y < self.H:
+                                if 0 <= x < scaled_W and 0 <= y < scaled_H:
                                     color = tuple(static_colors_bgr_uint8[visualized_gaussian_indices[i]].tolist())
-                                    cv2.circle(frame, (x, y), dot_radius, color, -1)
+                                    cv2.circle(frame, (x, y), 1, color, -1)  # Keep dot radius at 1
                                     dots_visible_in_frame += 1
 
                             # Save frame as PNG
@@ -447,32 +454,30 @@ class VideoTrainer:
                 # Render each frame
                 total_dots_visible = 0
                 for k in range(num_eval_frames):
-                    # Create blank frame
-                    frame = np.zeros((self.H, self.W, 3), dtype=np.uint8)
+                    # Create blank frame with scaled resolution
+                    frame = np.zeros((scaled_H, scaled_W, 3), dtype=np.uint8)
 
                     # Get xyz positions for this frame
                     xyz_k = all_xyz_normalized[k] # (N, 2)
                     xyz_k_viz = xyz_k[visualized_gaussian_indices] # (num_gaussians_in_viz, 2)
 
-                    # Transform normalized coordinates to pixel coordinates
-                    x_coords = (xyz_k_viz[:, 0] * 0.5 + 0.5) * (self.W - 1)
-                    y_coords = (xyz_k_viz[:, 1] * 0.5 + 0.5) * (self.H - 1)
+                    # Transform normalized coordinates to pixel coordinates (scaled)
+                    x_coords = (xyz_k_viz[:, 0] * 0.5 + 0.5) * (scaled_W - 1)
+                    y_coords = (xyz_k_viz[:, 1] * 0.5 + 0.5) * (scaled_H - 1)
 
                     # Draw each Gaussian center
                     dots_visible_in_frame = 0
                     for i in range(num_gaussians_in_viz):
                         x, y = int(x_coords[i]), int(y_coords[i])
-                        if 0 <= x < self.W and 0 <= y < self.H:
+                        if 0 <= x < scaled_W and 0 <= y < scaled_H:
                             color = tuple(static_colors_bgr_uint8[visualized_gaussian_indices[i]].tolist())
-                            cv2.circle(frame, (x, y), dot_radius, color, -1)
+                            cv2.circle(frame, (x, y), 1, color, -1)  # Keep dot radius at 1
                             dots_visible_in_frame += 1
 
                     total_dots_visible += dots_visible_in_frame
 
                     # Save frame to video
-                    success = video_writer.write(frame)
-                    if not success:
-                        print(f"Warning: Failed to write frame {k} to video")
+                    video_writer.write(frame)
 
                     # Save individual frame if requested
                     if self.save_frames:
