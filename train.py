@@ -329,7 +329,8 @@ class VideoTrainer:
             self.gaussian_model.train() # Set model back to training mode
             return 0.0, 0.0
 
-        num_eval_frames = min(self.num_frames_per_batch, self.total_T) if self.num_frames_per_batch > 0 else self.total_T
+        # Use all frames for evaluation
+        num_eval_frames = self.total_T
         if num_eval_frames == 0: # Should be caught by total_T check, but as safeguard
             print("Number of frames to evaluate is 0. Skipping evaluation.")
             self.gaussian_model.train()
