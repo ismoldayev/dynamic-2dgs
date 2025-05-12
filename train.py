@@ -771,8 +771,6 @@ def main(argv):
 
     try:
         # Load video frames using the utility function
-        # Load a specific number of evenly spaced frames based on args.num_frames
-        print(f"Loading {args.num_frames if args.num_frames > 0 else 'all'} evenly spaced frames from video for training and evaluation...")
         gt_frames_tensor, input_video_fps = video_path_to_tensor(
             video_path,
             num_frames=args.num_frames if args.num_frames > 0 else None,
