@@ -65,15 +65,18 @@ class VideoTrainer:
 
         # Adjust log directory naming - using self.total_T for total frames in video
         rigidity_str = f"_rigidN{args.k_neighbors}L{args.lambda_neighbor_rigidity:.0e}".replace("e-0", "e-") if args.lambda_neighbor_rigidity > 0 else ""
-        poly_deg_str = f"_polyDeg{args.polynomial_degree}"
+        poly_deg_str = f"_polyDeg{args.polynomial_degree}" if args.trajectory_model_type == "polynomial" else ""
         xyz_coeffs_reg_str = f"_xyzCoeffReg{args.lambda_xyz_coeffs_reg:.0e}".replace("e-0", "e-") if args.lambda_xyz_coeffs_reg > 0 else ""
         chol_coeffs_reg_str = f"_cholCoeffReg{args.lambda_cholesky_coeffs_reg:.0e}".replace("e-0", "e-") if args.lambda_cholesky_coeffs_reg > 0 else ""
         opac_coeffs_reg_str = f"_opacCoeffReg{args.lambda_opacity_coeffs_reg:.0e}".replace("e-0", "e-") if args.lambda_opacity_coeffs_reg > 0 else ""
         opac_poly_deg_str = f"_opacPolyDeg{args.opacity_polynomial_degree}" if args.opacity_polynomial_degree is not None else ""
         opt_str = f"_opt{args.opt_type}"
-        ema_str = f"_ema{args.ema_decay:.0e}".replace("e-0", "e-")
+        ema_str = f"_ema{args.ema_decay:.0e}".replace("e-0", "e-") if args.lambda_neighbor_rigidity > 0 else ""
+        target_pixels_str = f"_targetPixels{args.target_pixel_count}"
+        trajectory_str = f"_traj{args.trajectory_model_type}"
+        control_points_str = f"_ctrl{args.num_control_points}" if args.trajectory_model_type == "bspline" else ""
 
-        self.log_dir = Path(f"./checkpoints/{self.video_name}/iter{args.iterations}_pts{num_points}_totalFrames{self.total_T}_batchFrames{self.num_frames_per_batch}{rigidity_str}{poly_deg_str}{opac_poly_deg_str}{xyz_coeffs_reg_str}{chol_coeffs_reg_str}{opac_coeffs_reg_str}{opt_str}{ema_str}_lr{args.lr:.0e}")
+        self.log_dir = Path(f"./checkpoints/{self.video_name}/iter{args.iterations}_pts{num_points}_totalFrames{self.total_T}_batchFrames{self.num_frames_per_batch}{trajectory_str}{control_points_str}{rigidity_str}{poly_deg_str}{opac_poly_deg_str}{xyz_coeffs_reg_str}{chol_coeffs_reg_str}{opac_coeffs_reg_str}{opt_str}{ema_str}{target_pixels_str}_lr{args.lr:.0e}")
         self.log_dir.mkdir(parents=True, exist_ok=True)
         print(f"Logging to: {self.log_dir}")
 
