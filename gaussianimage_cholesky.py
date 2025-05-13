@@ -11,6 +11,12 @@ from typing import Optional
 import torch.nn.functional as F # For cosine similarity
 from scipy.interpolate import BSpline
 
+# --- Optical Flow Loss Constants (User can modify these manually) ---
+ENABLE_OPTICAL_FLOW_LOSS = True # Master switch for this feature
+LAMBDA_OPTICAL_FLOW = 1e4      # Weight for the optical flow loss term
+OPTICAL_FLOW_OPACITY_THRESHOLD = 0.2 # Min opacity for a Gaussian to be affected by flow loss
+# --- End Optical Flow Loss Constants ---
+
 # Helper for logit transformation
 def _logit(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     x_clamped = torch.clamp(x, eps, 1.0 - eps)
@@ -737,7 +743,7 @@ class GaussianImage_Cholesky(nn.Module):
         final_rendered_tensor = torch.stack(all_frames_rendered, dim=0) # (num_frames_to_render, C, H, W)
         return {"render": final_rendered_tensor}
 
-    def train_iter(self, gt_frames_batch: torch.Tensor, t_values_batch: torch.Tensor):
+    def train_iter(self, gt_frames_batch: torch.Tensor, t_values_batch: torch.Tensor, precomputed_flows_for_batch: Optional[torch.Tensor] = None):
         """Performs one training iteration using a batch of frames and their t_values."""
         total_loss = 0
         total_psnr = 0
@@ -760,6 +766,80 @@ class GaussianImage_Cholesky(nn.Module):
 
         average_loss = total_loss / T_batch
         average_psnr = total_psnr / T_batch
+
+       # --- BEGIN VECTORIZED OPTICAL FLOW LOSS CALCULATION ---
+        if ENABLE_OPTICAL_FLOW_LOSS and \
+           T_batch > 1 and \
+           self.num_points > 0 and \
+           precomputed_flows_for_batch is not None and \
+           precomputed_flows_for_batch.shape[0] == T_batch - 1:
+
+            if self.trajectory_model_type == "polynomial":
+                batch_xyz_eval, _, batch_opacity_eval = self._get_evaluated_polynomials(t_values_batch)
+            elif self.trajectory_model_type == "bspline":
+                batch_xyz_eval, _, batch_opacity_eval = self._get_evaluated_bsplines(t_values_batch)
+            else:
+                batch_xyz_eval = torch.empty(T_batch, self.num_points, 2, device=self.device)
+                batch_opacity_eval = torch.empty(T_batch, self.num_points, 1, device=self.device)
+
+            xyz_t_prevs = batch_xyz_eval[:-1]
+            opacity_t_prevs = batch_opacity_eval[:-1]
+            xyz_t_curr_models = batch_xyz_eval[1:]
+
+            active_gaussians_mask = (opacity_t_prevs.squeeze(-1) > OPTICAL_FLOW_OPACITY_THRESHOLD)
+
+            if not torch.any(active_gaussians_mask):
+                 mean_optical_flow_loss = torch.tensor(0.0, device=self.device)
+            else:
+                flows_to_sample = precomputed_flows_for_batch.permute(0, 3, 1, 2) # (T-1, 2, H, W)
+                sampling_grid = xyz_t_prevs.unsqueeze(2) # (T-1, N, 1, 2)
+
+                # Sample flow vectors
+                # grid_sample output: (N_batch, C, H_out, W_out) -> (T-1, 2, N, 1)
+                sampled_flow_vectors_raw = F.grid_sample(
+                    flows_to_sample,
+                    sampling_grid,
+                    mode='bilinear',
+                    padding_mode='border',
+                    align_corners=True # Using True, common for normalized coords
+                ) # Shape: (T-1, 2, N, 1)
+
+                # Reshape to (T-1, N, 2)
+                sampled_flow_vectors_pixel_space = sampled_flow_vectors_raw.squeeze(3).permute(0, 2, 1) # (T-1, N, 2)
+
+
+                # The sampled_flow_vectors are displacements in pixel units.
+                # Scale them to normalized coordinate units.
+                # Flow_dx (pixels) / (W-1) * 2 gives normalized displacement_x.
+                # Flow_dy (pixels) / (H-1) * 2 gives normalized displacement_y.
+                # Ensure W and H are not zero to avoid division by zero
+                if self.W <=1 or self.H <=1: # Should not happen if frames are loaded
+                    scale_x = 0.0
+                    scale_y = 0.0
+                else:
+                    scale_x = 2.0 / (self.W - 1)
+                    scale_y = 2.0 / (self.H - 1)
+
+                flow_scale = torch.tensor([scale_x, scale_y], device=self.device).view(1, 1, 2)
+                sampled_flow_vectors_normalized_delta = sampled_flow_vectors_pixel_space * flow_scale # (T-1, N, 2)
+
+                xyz_t_curr_flow_pred_norm = xyz_t_prevs + sampled_flow_vectors_normalized_delta # (T-1, N, 2)
+
+                pos_diff = xyz_t_curr_models - xyz_t_curr_flow_pred_norm
+                loss_all_pairs_all_gaussians = torch.sum(pos_diff**2, dim=2)
+                weighted_loss_all = loss_all_pairs_all_gaussians * opacity_t_prevs.squeeze(-1)
+                masked_weighted_loss = weighted_loss_all * active_gaussians_mask.float()
+                total_masked_loss_sum = torch.sum(masked_weighted_loss)
+                num_active_gaussians_total = torch.sum(active_gaussians_mask.float())
+
+                if num_active_gaussians_total > 0:
+                    mean_optical_flow_loss = total_masked_loss_sum / num_active_gaussians_total
+                else:
+                    mean_optical_flow_loss = torch.tensor(0.0, device=self.device)
+
+            if not torch.isnan(mean_optical_flow_loss) and not torch.isinf(mean_optical_flow_loss):
+                average_loss += LAMBDA_OPTICAL_FLOW * mean_optical_flow_loss
+        # --- END VECTORIZED OPTICAL FLOW LOSS CALCULATION ---
 
         # Add L2 regularization on coefficients/control points
         if self.lambda_xyz_coeffs_reg > 0:

@@ -20,7 +20,7 @@ from tqdm import tqdm
 import random
 import torchvision.transforms as transforms
 # Import the updated model
-from gaussianimage_cholesky import GaussianImage_Cholesky
+from gaussianimage_cholesky import GaussianImage_Cholesky, LAMBDA_OPTICAL_FLOW
 from optimizer import Adan # Make sure Adan is imported if used in re-init
 # Import cv2 for video writing
 import cv2
@@ -76,9 +76,42 @@ class VideoTrainer:
         trajectory_str = f"_traj{args.trajectory_model_type}"
         control_points_str = f"_ctrl{args.num_control_points}" if args.trajectory_model_type == "bspline" else ""
 
-        self.log_dir = Path(f"./checkpoints/{self.video_name}/iter{args.iterations}_pts{num_points}_totalFrames{self.total_T}_batchFrames{self.num_frames_per_batch}{trajectory_str}{control_points_str}{rigidity_str}{poly_deg_str}{opac_poly_deg_str}{xyz_coeffs_reg_str}{chol_coeffs_reg_str}{opac_coeffs_reg_str}{opt_str}{ema_str}{target_pixels_str}_lr{args.lr:.0e}")
+        self.log_dir = Path(f"./checkpoints/{self.video_name}/iter{args.iterations}_pts{num_points}_totalFrames{self.total_T}_batchFrames{self.num_frames_per_batch}{trajectory_str}{control_points_str}{rigidity_str}{poly_deg_str}{opac_poly_deg_str}{xyz_coeffs_reg_str}{chol_coeffs_reg_str}{opac_coeffs_reg_str}{opt_str}{ema_str}{target_pixels_str}_lr{args.lr:.0e}_optflow{LAMBDA_OPTICAL_FLOW}")
         self.log_dir.mkdir(parents=True, exist_ok=True)
         print(f"Logging to: {self.log_dir}")
+
+        # --- BEGIN OPTICAL FLOW PRE-COMPUTATION ---
+        self.precomputed_optical_flows = None
+        # Constants for optical flow are now better placed in gaussianimage_cholesky.py
+        # but we need to know if it's enabled to decide whether to precompute.
+        # For simplicity, we'll assume if this code block is active, ENABLE_OPTICAL_FLOW_LOSS is effectively True.
+        # A cleaner way would be to pass a flag or read the constant from the model.
+        # For now, let's proceed with direct pre-computation if total_T > 1.
+
+        if self.total_T > 1: # Need at least two frames to compute flow
+            print("Pre-computing optical flow fields for all Gound Truth frames...")
+            # Store flows on CPU as NumPy arrays first, then convert to tensor and move to device
+            # This avoids holding many large GPU tensors if memory is tight during pre-computation.
+            flows_list_np = []
+            for i in range(self.total_T - 1):
+                frame_prev_np = (self.all_gt_frames[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                frame_curr_np = (self.all_gt_frames[i+1].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                gray_prev = cv2.cvtColor(frame_prev_np, cv2.COLOR_RGB2GRAY)
+                gray_curr = cv2.cvtColor(frame_curr_np, cv2.COLOR_RGB2GRAY)
+                flow_cv = cv2.calcOpticalFlowFarneback(gray_prev, gray_curr, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+                flows_list_np.append(flow_cv)
+                if (i + 1) % 50 == 0 or (i + 1) == (self.total_T - 1) : # Log progress
+                    print(f"  Computed flow for frame pair {i+1}/{self.total_T -1}")
+
+            if flows_list_np:
+                self.precomputed_optical_flows = torch.from_numpy(np.stack(flows_list_np)).to(self.device)
+                # self.precomputed_optical_flows will have shape (total_T - 1, H, W, 2)
+                print(f"Finished pre-computing optical flows. Shape: {self.precomputed_optical_flows.shape}")
+            else:
+                print("No optical flows were computed (less than 2 frames or empty list).")
+        else:
+            print("Skipping optical flow pre-computation (total_T <= 1).")
+        # --- END OPTICAL FLOW PRE-COMPUTATION ---
 
         # Instantiate the Gaussian model with total_T frames
         self.gaussian_model = GaussianImage_Cholesky(
@@ -241,7 +274,7 @@ class VideoTrainer:
                     t_values_batch = self.all_t_values
 
                 if gt_frames_batch.shape[0] > 0: # Ensure batch is not empty
-                     loss, psnr = self.gaussian_model.train_iter(gt_frames_batch, t_values_batch)
+                     loss, psnr = self.gaussian_model.train_iter(gt_frames_batch, t_values_batch, precomputed_flows_for_batch=self.precomputed_optical_flows)
                 else: # Should not happen if logic above is correct
                     loss, psnr = 0.0, 0.0
             else: # No frames loaded
